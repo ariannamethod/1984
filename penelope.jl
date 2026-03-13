@@ -240,7 +240,7 @@ const VOCAB = [
 ]
 
 
-const V = length(VOCAB)  # 1984
+const V = length(VOCAB)  # 1990 (1984 canonical + 6 overlapping entries)
 const STEPS = 12
 const D = 384            # embedding dim
 const M = 768            # SwiGLU hidden dim
