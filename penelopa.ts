@@ -1,10 +1,39 @@
-// penelope.ts — 1984 words. 12 steps of resonance. Dario Equation.
-// TypeScript version. Single file. No dependencies.
+// penelopa.ts — 1984 words. 12 steps of resonance. Dario Equation.
+//
+// Trainable resonance engine. Not a transformer. A mirror that learns.
+//
+// Input:  text → vocab word IDs (prefix matching)
+// Attend: RRPRAM resonance + SwiGLU per step (how it thinks)
+// Output: word-level from 1984 vocab (gibberish impossible)
+//
+// 12 learned step-weights (~1M each). Each step has its own lens.
+// Step 1 sees the surface. Step 12 sees the bone.
+//
+// Architecture per step s:
+//     context = pool(embed(words))
+//     query   = RMSNorm(context @ Wr_s)          RRPRAM resonance
+//     hidden  = SwiGLU(query; gate_s, up_s, down_s)
+//     logits  = (query + hidden) @ E^T            tied output
+//     logits += DarioField(context)               live overlay
+//     word    = sample(softmax(logits))
+//
+// Total: ~13M params (762K embed + 12 × 1.03M steps)
+//
+//   npx tsx penelopa.ts                                  # interactive
+//   npx tsx penelopa.ts "darkness eats the city"         # single chain
+//   npx tsx penelopa.ts --train corpus.txt               # train
+//   npx tsx penelopa.ts --train corpus.txt --steps 5000  # train N steps
+//   npx tsx penelopa.ts --load penelope.bin              # load weights
+//   npx tsx penelopa.ts --save penelope.bin              # save after
+//
 // By Arianna Method. הרזוננס לא נשבר
 
-// ================================================================
-// 1984 WORDS (same as Python/JS/C versions)
-// ================================================================
+import * as fs from "fs";
+import * as readline from "readline";
+
+// ═══════════════════════════════════════════════════════════════
+// 1984 WORDS
+// ═══════════════════════════════════════════════════════════════
 
 const VOCAB: string[] = [
   // BODY 0-99
@@ -235,53 +264,527 @@ const VOCAB: string[] = [
   "permission","prohibition","transgression","taboo","norm","deviation","exception","precedent","custom","habit",
   "witness","testimony","evidence","proof","alibi","verdict","appeal","clemency","execution","reprieve",
   "debt","credit","interest","principal","collateral","default","bankruptcy","solvency","dividend","investment"
-] as const;
+];
 
+const V = VOCAB.length; // 1984
 const STEPS = 12;
-const STOP_WORDS = new Set([
-  "i","me","my","we","our","you","your","he","she","it","they","them","the","a","an",
-  "and","or","but","in","on","at","to","for","of","is","am","are","was","were","be",
-  "been","being","have","has","had","do","does","did","will","would","shall","should",
-  "can","could","may","might","must","not","no","nor","so","if","then","than","that",
-  "this","these","those","what","which","who","whom","how","when","where","why","all",
-  "each","every","some","any","few","many","much","more","most","other","another","such"
-]);
+const D = 384;          // embedding dim
+const M = 768;          // SwiGLU hidden dim
 
-// ================================================================
-// DARIO FIELD STATE
-// ================================================================
+const VOCAB_IDX = new Map<string, number>();
+for (let i = 0; i < VOCAB.length; i++) {
+  if (!VOCAB_IDX.has(VOCAB[i])) {
+    VOCAB_IDX.set(VOCAB[i], i);
+  }
+}
 
-// Co-occurrence matrix (undirected)
-const cooc = new Map<string, number>(); // key: "min|max" -> count
-const bigrams = new Map<string, Map<string, number>>(); // prev -> {next: count}
-let destiny = new Array(8).fill(0);
-let trauma = 0;
-let prophecyTarget: string | null = null;
-let prophecyAge = 0;
+const STOP = new Set(
+  "i me my we our you your he she it they them the a an and or but in on at to for of is am are was were be been being have has had do does did will would shall should can could may might must not no nor so if then than that this these those what which who whom how when where why all each every some any few many much more most other another such".split(" ")
+);
 
-// Kuramoto chambers
-const chambers = {
-  fear: 0,
-  love: 0,
-  rage: 0,
-  void_: 0,
-  flow: 0,
-  complex: 0
-};
-const chamberDecay = {
-  fear: 0.95,
-  love: 0.95,
-  rage: 0.93,
-  void_: 0.96,
-  flow: 0.94,
-  complex: 0.97
-};
 
-// ================================================================
-// UTILITIES
-// ================================================================
+// ═══════════════════════════════════════════════════════════════
+// MATH — pure TypeScript, no dependencies
+// ═══════════════════════════════════════════════════════════════
 
-function wordCategory(idx: number): number {
+function randn(): number {
+  const u1 = Math.random() + 1e-12;
+  const u2 = Math.random() + 1e-12;
+  return Math.sqrt(-2 * Math.log(u1)) * Math.cos(6.2831853 * u2);
+}
+
+function zeros(n: number): number[] {
+  return new Array(n).fill(0.0);
+}
+
+function dot(a: number[], b: number[]): number {
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += a[i] * b[i];
+  return s;
+}
+
+function vadd(a: number[], b: number[]): number[] {
+  const out = new Array(a.length);
+  for (let i = 0; i < a.length; i++) out[i] = a[i] + b[i];
+  return out;
+}
+
+function vsub(a: number[], b: number[]): number[] {
+  const out = new Array(a.length);
+  for (let i = 0; i < a.length; i++) out[i] = a[i] - b[i];
+  return out;
+}
+
+function vscale(a: number[], s: number): number[] {
+  const out = new Array(a.length);
+  for (let i = 0; i < a.length; i++) out[i] = a[i] * s;
+  return out;
+}
+
+function matmul_mv(W: number[], x: number[], rows: number, cols: number): number[] {
+  const out = zeros(rows);
+  for (let i = 0; i < rows; i++) {
+    let s = 0.0;
+    for (let j = 0; j < cols; j++) {
+      s += W[i * cols + j] * x[j];
+    }
+    out[i] = s;
+  }
+  return out;
+}
+
+function matmul_mtv(W: number[], x: number[], rows: number, cols: number): number[] {
+  const out = zeros(cols);
+  for (let j = 0; j < cols; j++) {
+    let s = 0.0;
+    for (let i = 0; i < rows; i++) {
+      s += W[i * cols + j] * x[i];
+    }
+    out[j] = s;
+  }
+  return out;
+}
+
+function rmsnorm(x: number[], g: number[], n: number): number[] {
+  let ss = 0;
+  for (let i = 0; i < n; i++) ss += x[i] * x[i];
+  ss = ss / n + 1e-5;
+  const inv = 1.0 / Math.sqrt(ss);
+  const out = new Array(n);
+  for (let i = 0; i < n; i++) out[i] = g[i] * x[i] * inv;
+  return out;
+}
+
+function silu(x: number): number {
+  return x > -20 ? x / (1.0 + Math.exp(-x)) : 0.0;
+}
+
+function softmax(x: number[]): number[] {
+  let mx = x[0];
+  for (let i = 1; i < x.length; i++) if (x[i] > mx) mx = x[i];
+  const e = new Array(x.length);
+  let s = 0;
+  for (let i = 0; i < x.length; i++) {
+    e[i] = Math.exp(x[i] - mx);
+    s += e[i];
+  }
+  for (let i = 0; i < x.length; i++) e[i] /= s;
+  return e;
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// MODEL — 12 step-specific weight sets + shared embedding
+// ═══════════════════════════════════════════════════════════════
+
+class StepWeights {
+  wr: number[];
+  rms: number[];
+  w_gate: number[];
+  w_up: number[];
+  w_down: number[];
+
+  constructor() {
+    const scale_d = Math.sqrt(2.0 / D);
+    const scale_m = Math.sqrt(2.0 / M);
+    this.wr = new Array(D * D);
+    for (let i = 0; i < D * D; i++) this.wr[i] = randn() * scale_d;
+    this.rms = new Array(D).fill(1.0);
+    this.w_gate = new Array(D * M);
+    for (let i = 0; i < D * M; i++) this.w_gate[i] = randn() * scale_d;
+    this.w_up = new Array(D * M);
+    for (let i = 0; i < D * M; i++) this.w_up[i] = randn() * scale_d;
+    this.w_down = new Array(M * D);
+    for (let i = 0; i < M * D; i++) this.w_down[i] = randn() * scale_m;
+  }
+
+  paramCount(): number {
+    return D * D + D + D * M + D * M + M * D;
+  }
+
+  params(): number[] {
+    return [...this.wr, ...this.rms, ...this.w_gate, ...this.w_up, ...this.w_down];
+  }
+
+  loadFrom(flat: number[], offset: number): number {
+    let o = offset;
+    this.wr = flat.slice(o, o + D * D); o += D * D;
+    this.rms = flat.slice(o, o + D); o += D;
+    this.w_gate = flat.slice(o, o + D * M); o += D * M;
+    this.w_up = flat.slice(o, o + D * M); o += D * M;
+    this.w_down = flat.slice(o, o + M * D); o += M * D;
+    return o;
+  }
+}
+
+
+class Penelope {
+  embed: number[];
+  steps: StepWeights[];
+
+  constructor() {
+    const scale = Math.sqrt(2.0 / V);
+    this.embed = new Array(V * D);
+    for (let i = 0; i < V * D; i++) this.embed[i] = randn() * scale;
+    this.steps = [];
+    for (let i = 0; i < STEPS; i++) this.steps.push(new StepWeights());
+  }
+
+  paramCount(): number {
+    let total = V * D;
+    for (const s of this.steps) total += s.paramCount();
+    return total;
+  }
+
+  getEmbed(idx: number): number[] {
+    return this.embed.slice(idx * D, (idx + 1) * D);
+  }
+
+  poolContext(wordIds: number[]): number[] {
+    if (wordIds.length === 0) return zeros(D);
+    const ctx = zeros(D);
+    for (const wid of wordIds) {
+      const e = this.getEmbed(wid);
+      for (let j = 0; j < D; j++) ctx[j] += e[j];
+    }
+    const inv = 1.0 / wordIds.length;
+    for (let j = 0; j < D; j++) ctx[j] *= inv;
+    return ctx;
+  }
+
+  forwardStep(contextIds: number[], stepIdx: number): number[] {
+    const sw = this.steps[stepIdx];
+    const ctx = this.poolContext(contextIds);
+
+    // RRPRAM resonance
+    let query = matmul_mv(sw.wr, ctx, D, D);
+
+    // RMSNorm
+    query = rmsnorm(query, sw.rms, D);
+
+    // SwiGLU
+    const gate = matmul_mv(sw.w_gate, query, M, D);
+    const up = matmul_mv(sw.w_up, query, M, D);
+    const swiglu = new Array(M);
+    for (let i = 0; i < M; i++) swiglu[i] = silu(gate[i]) * up[i];
+    const hidden = matmul_mv(sw.w_down, swiglu, D, M);
+
+    // Residual
+    const out = vadd(query, hidden);
+
+    // Logits = E @ out (tied weights)
+    const logits = matmul_mv(this.embed, out, V, D);
+    return logits;
+  }
+
+  save(path: string): void {
+    const flat: number[] = [...this.embed];
+    for (const s of this.steps) flat.push(...s.params());
+
+    const headerBuf = Buffer.alloc(16);
+    headerBuf.writeInt32LE(V, 0);
+    headerBuf.writeInt32LE(D, 4);
+    headerBuf.writeInt32LE(M, 8);
+    headerBuf.writeInt32LE(STEPS, 12);
+
+    const bodyBuf = Buffer.alloc(flat.length * 4);
+    for (let i = 0; i < flat.length; i++) bodyBuf.writeFloatLE(flat[i], i * 4);
+
+    const fd = fs.openSync(path, "w");
+    fs.writeSync(fd, headerBuf);
+    fs.writeSync(fd, bodyBuf);
+    fs.closeSync(fd);
+
+    const size = fs.statSync(path).size;
+    console.log(`  saved ${path}: ${flat.length} params (${(size / 1e6).toFixed(1)}MB)`);
+  }
+
+  load(path: string): void {
+    const data = fs.readFileSync(path);
+    const v = data.readInt32LE(0);
+    const d = data.readInt32LE(4);
+    const m = data.readInt32LE(8);
+    const st = data.readInt32LE(12);
+    if (v !== V || d !== D || m !== M || st !== STEPS) {
+      throw new Error(`config mismatch: file has V=${v} D=${d} M=${m} S=${st}`);
+    }
+    const numFloats = (data.length - 16) / 4;
+    const flat: number[] = new Array(numFloats);
+    for (let i = 0; i < numFloats; i++) flat[i] = data.readFloatLE(16 + i * 4);
+
+    let o = 0;
+    this.embed = flat.slice(o, o + V * D); o += V * D;
+    for (const s of this.steps) {
+      o = s.loadFrom(flat, o);
+    }
+    console.log(`  loaded ${path}: ${flat.length} params`);
+  }
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// TOKENIZER — map arbitrary text to word IDs in our 1984 vocab
+// ═══════════════════════════════════════════════════════════════
+
+function tokenize_text(text: string): number[] {
+  const words = text.toLowerCase().match(/[a-z]+/g) || [];
+  const ids: number[] = [];
+  for (const w of words) {
+    if (STOP.has(w) || w.length < 2) continue;
+    if (VOCAB_IDX.has(w)) {
+      ids.push(VOCAB_IDX.get(w)!);
+    } else {
+      let best = -1;
+      let bestLen = 0;
+      for (const [vw, vi] of VOCAB_IDX) {
+        const ml = Math.min(w.length, vw.length);
+        let plen = 0;
+        for (let k = 0; k < ml; k++) {
+          if (w[k] === vw[k]) plen++;
+          else break;
+        }
+        if (plen > bestLen) {
+          bestLen = plen;
+          best = vi;
+        }
+      }
+      if (best >= 0 && bestLen >= 3) {
+        ids.push(best);
+      }
+    }
+  }
+  return ids;
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// TRAINING — next-word prediction, step s predicts word[s+1]
+// ═══════════════════════════════════════════════════════════════
+
+function train(model: Penelope, dataPath: string, steps: number = 5000, lr: number = 3e-4): void {
+  const text = fs.readFileSync(dataPath, "utf-8");
+  const ids = tokenize_text(text);
+  if (ids.length < STEPS + 2) {
+    console.log(`  corpus too small: ${ids.length} words (need ${STEPS + 2}+)`);
+    return;
+  }
+
+  console.log(`  corpus: ${text.length} chars → ${ids.length} vocab words`);
+  console.log(`  model: ${model.paramCount().toLocaleString()} params (${(model.paramCount() * 4 / 1e6).toFixed(1)}MB f32)`);
+  console.log(`  training: ${steps} steps, lr=${lr.toExponential(1)}`);
+
+  const window = STEPS + 1;
+  let bestLoss = Infinity;
+
+  for (let step = 1; step <= steps; step++) {
+    const start = Math.floor(Math.random() * (ids.length - window));
+    const win = ids.slice(start, start + window);
+
+    let totalLoss = 0.0;
+
+    for (let s = 0; s < STEPS; s++) {
+      const context = win.slice(0, s + 1);
+      const target = win[s + 1];
+
+      const logits = model.forwardStep(context, s);
+      const probs = softmax(logits);
+      let p = probs[target];
+      if (p < 1e-10) p = 1e-10;
+      totalLoss -= Math.log(p);
+
+      // gradient: d_logits = probs - one_hot(target)
+      const d_logits = [...probs];
+      d_logits[target] -= 1.0;
+
+      const sw = model.steps[s];
+      const ctx = model.poolContext(context);
+
+      // reconstruct forward
+      const query = matmul_mv(sw.wr, ctx, D, D);
+      const query_n = rmsnorm(query, sw.rms, D);
+      const gate = matmul_mv(sw.w_gate, query_n, M, D);
+      const up = matmul_mv(sw.w_up, query_n, M, D);
+      const swiglu = new Array(M);
+      for (let i = 0; i < M; i++) swiglu[i] = silu(gate[i]) * up[i];
+      const hidden = matmul_mv(sw.w_down, swiglu, D, M);
+      const out = vadd(query_n, hidden);
+
+      // d_out from tied weights
+      const d_out = zeros(D);
+      for (let v = 0; v < V; v++) {
+        if (Math.abs(d_logits[v]) < 1e-8) continue;
+        const ev = model.getEmbed(v);
+        for (let j = 0; j < D; j++) {
+          d_out[j] += d_logits[v] * ev[j];
+        }
+      }
+
+      // update embedding (SGD on tied weights)
+      for (let v = 0; v < V; v++) {
+        if (Math.abs(d_logits[v]) < 1e-8) continue;
+        const base = v * D;
+        for (let j = 0; j < D; j++) {
+          model.embed[base + j] -= lr * d_logits[v] * out[j];
+        }
+      }
+
+      // d_hidden (residual)
+      const d_hidden = [...d_out];
+
+      // backprop through w_down
+      const d_swiglu = matmul_mtv(sw.w_down, d_hidden, D, M);
+      for (let i = 0; i < M; i++) {
+        for (let j = 0; j < D; j++) {
+          sw.w_down[i * D + j] -= lr * swiglu[i] * d_hidden[j];
+        }
+      }
+
+      // backprop through SwiGLU
+      for (let i = 0; i < M; i++) {
+        const sg = silu(gate[i]);
+        const sig = gate[i] > -20 ? 1.0 / (1.0 + Math.exp(-gate[i])) : 0;
+        const silu_grad = gate[i] > -20 ? sig * (1.0 + gate[i] * (1.0 - sig)) : 0;
+        const d_gate_i = d_swiglu[i] * up[i] * silu_grad;
+        const d_up_i = d_swiglu[i] * sg;
+
+        for (let j = 0; j < D; j++) {
+          sw.w_gate[i * D + j] -= lr * d_gate_i * query_n[j];
+          sw.w_up[i * D + j] -= lr * d_up_i * query_n[j];
+        }
+      }
+
+      // d_query_n (from SwiGLU input + residual)
+      const d_qn = [...d_out];
+      const d_gate_vec = new Array(M);
+      for (let i = 0; i < M; i++) {
+        const sig = gate[i] > -20 ? 1.0 / (1.0 + Math.exp(-gate[i])) : 0;
+        const silu_grad = gate[i] > -20 ? sig * (1.0 + gate[i] * (1.0 - sig)) : 0;
+        d_gate_vec[i] = d_swiglu[i] * up[i] * silu_grad;
+      }
+      const d_qn_gate = matmul_mtv(sw.w_gate, d_gate_vec, M, D);
+      const d_up_vec = new Array(M);
+      for (let i = 0; i < M; i++) d_up_vec[i] = d_swiglu[i] * silu(gate[i]);
+      const d_qn_up = matmul_mtv(sw.w_up, d_up_vec, M, D);
+      for (let j = 0; j < D; j++) d_qn[j] += d_qn_gate[j] + d_qn_up[j];
+
+      // approx RMSNorm backward
+      let ss = 0;
+      for (let i = 0; i < D; i++) ss += query[i] * query[i];
+      ss = ss / D + 1e-5;
+      const inv = 1.0 / Math.sqrt(ss);
+      const d_query = new Array(D);
+      for (let i = 0; i < D; i++) d_query[i] = d_qn[i] * sw.rms[i] * inv;
+
+      // update Wr
+      for (let i = 0; i < D; i++) {
+        if (Math.abs(d_query[i]) < 1e-8) continue;
+        for (let j = 0; j < D; j++) {
+          sw.wr[i * D + j] -= lr * d_query[i] * ctx[j];
+        }
+      }
+    }
+
+    const avgLoss = totalLoss / STEPS;
+    if (avgLoss < bestLoss) bestLoss = avgLoss;
+
+    if (step % 50 === 0 || step === 1) {
+      console.log(`  step ${String(step).padStart(5)}/${steps}  loss=${avgLoss.toFixed(4)}  best=${bestLoss.toFixed(4)}`);
+    }
+  }
+
+  console.log(`  training complete. best loss: ${bestLoss.toFixed(4)}`);
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// DARIO FIELD — live co-occurrence overlay
+// ═══════════════════════════════════════════════════════════════
+
+class DarioField {
+  cooc: Map<string, number>;
+  bigrams: Map<string, Map<string, number>>;
+  destiny: number[];
+  trauma: number;
+  prophecyTarget: number | null;
+  prophecyAge: number;
+  chambers: Record<string, number>;
+  decay: Record<string, number>;
+
+  constructor() {
+    this.cooc = new Map();
+    this.bigrams = new Map();
+    this.destiny = new Array(8).fill(0.0);
+    this.trauma = 0.0;
+    this.prophecyTarget = null;
+    this.prophecyAge = 0;
+    this.chambers = { fear: 0, love: 0, rage: 0, void: 0, flow: 0, complex: 0 };
+    this.decay = { fear: 0.95, love: 0.95, rage: 0.93, void: 0.96, flow: 0.94, complex: 0.97 };
+  }
+
+  updateCooc(w1: number, w2: number): void {
+    const k = `${Math.min(w1, w2)}|${Math.max(w1, w2)}`;
+    this.cooc.set(k, (this.cooc.get(k) || 0) + 1.0);
+  }
+
+  getCooc(w1: number, w2: number): number {
+    const k = `${Math.min(w1, w2)}|${Math.max(w1, w2)}`;
+    return this.cooc.get(k) || 0.0;
+  }
+
+  updateChambers(stepIdx: number): void {
+    const C = this.chambers;
+    const depth = stepIdx / STEPS;
+    const phase = depth < 0.33 ? 0 : depth < 0.66 ? 1 : 2;
+    if (phase === 0) C["flow"] += 0.05;
+    if (phase === 1) C["fear"] += 0.04;
+    if (phase === 2) C["void"] += 0.05;
+    if (depth > 0.75) C["complex"] += 0.03;
+    if (this.trauma > 0.3) C["rage"] += 0.04;
+    const K = 0.02;
+    const old: Record<string, number> = { ...C };
+    for (const i in C) {
+      for (const j in C) {
+        if (i !== j) {
+          C[i] += K * Math.sin(old[j] - old[i]);
+        }
+      }
+    }
+    for (const k in C) {
+      C[k] = Math.max(0, Math.min(1, C[k] * (this.decay[k] ?? 0.95)));
+    }
+  }
+
+  overlay(logits: number[], contextIds: number[], stepIdx: number): number[] {
+    const C = this.chambers;
+    const alphaMod = 1 + 0.3 * C["love"] - 0.2 * C["rage"] + 0.1 * C["flow"];
+    const gammaMod = 1 + 0.4 * C["void"] + 0.2 * C["complex"];
+
+    for (let v = 0; v < V; v++) {
+      let h = 0.0;
+      const recent = contextIds.slice(-8);
+      for (const ci of recent) {
+        h += this.getCooc(ci, v);
+      }
+      if (h > 0) {
+        logits[v] += alphaMod * 0.3 * Math.min(h, 1.0);
+      }
+
+      if (this.prophecyTarget !== null && v === this.prophecyTarget) {
+        logits[v] += 0.5 * Math.log(1 + this.prophecyAge);
+      }
+
+      const cat = word_category(v);
+      let dMax = 0.01;
+      for (const d of this.destiny) if (Math.abs(d) > dMax) dMax = Math.abs(d);
+      logits[v] += gammaMod * 0.25 * this.destiny[cat] / dMax;
+    }
+
+    return logits;
+  }
+}
+
+
+function word_category(idx: number): number {
   if (idx < 100) return 0;
   if (idx < 200) return 1;
   if (idx < 300) return 2;
@@ -292,509 +795,195 @@ function wordCategory(idx: number): number {
   return 7;
 }
 
-function updateCooc(a: string, b: string) {
-  const key = a < b ? `${a}|${b}` : `${b}|${a}`;
-  cooc.set(key, (cooc.get(key) || 0) + 1);
-}
 
-function getCooc(a: string, b: string): number {
-  const key = a < b ? `${a}|${b}` : `${b}|${a}`;
-  return cooc.get(key) || 0;
-}
+// ═══════════════════════════════════════════════════════════════
+// GENERATION — 12 steps, each picks one word
+// ═══════════════════════════════════════════════════════════════
 
-function updateBigram(prev: string, next: string) {
-  if (!bigrams.has(prev)) bigrams.set(prev, new Map());
-  const m = bigrams.get(prev)!;
-  m.set(next, (m.get(next) || 0) + 1);
-}
-
-function updateChambers(stepIdx: number) {
-  const depth = stepIdx / STEPS;
-  const phase = depth < 0.33 ? 0 : depth < 0.66 ? 1 : 2;
-  if (phase === 0) chambers.flow += 0.05;
-  if (phase === 1) chambers.fear += 0.04;
-  if (phase === 2) chambers.void_ += 0.05;
-  if (depth > 0.75) chambers.complex += 0.03;
-  if (trauma > 0.3) chambers.rage += 0.04;
-
-  const K = 0.02;
-  const old = { ...chambers };
-  const names = Object.keys(chambers) as (keyof typeof chambers)[];
-  for (const i of names) {
-    for (const j of names) {
-      if (i !== j) {
-        (chambers as any)[i] += K * Math.sin(old[j] - old[i]);
-      }
-    }
-  }
-
-  for (const k of names) {
-    (chambers as any)[k] *= chamberDecay[k];
-    (chambers as any)[k] = Math.max(0, Math.min(1, (chambers as any)[k]));
-  }
-}
-
-function darioScore(
-  candidate: string,
-  context: string[],
-  prevWord: string | null,
-  stepIdx: number
-): number {
-  const cidx = VOCAB.indexOf(candidate);
-  if (cidx < 0) return -Infinity;
-
-  const alphaMod = 1 + 0.3 * chambers.love - 0.2 * chambers.rage + 0.1 * chambers.flow;
-  const gammaMod = 1 + 0.4 * chambers.void_ + 0.2 * chambers.complex;
-
-  // B: bigram
-  let B = 0;
-  if (prevWord && bigrams.has(prevWord)) {
-    const m = bigrams.get(prevWord)!;
-    const maxVal = Math.max(...m.values(), 0.001);
-    B = (m.get(candidate) || 0) / maxVal;
-  }
-
-  // H: Hebbian co-occurrence with context
-  let H = 0;
-  for (let i = 0; i < context.length; i++) {
-    H += getCooc(context[i], candidate) * (1 / (context.length - i));
-  }
-  H = Math.min(H, 1);
-
-  // F: prophecy
-  let F = 0;
-  if (prophecyTarget && candidate === prophecyTarget) {
-    F = 0.5 * Math.log(1 + prophecyAge);
-  }
-
-  // A: destiny attraction (category alignment)
-  const cat = wordCategory(cidx);
-  const dMax = Math.max(...destiny.map(Math.abs), 0.01);
-  let A = destiny[cat] / dMax;
-
-  // T: trauma (deeper words in later steps)
-  let T = 0;
-  if (trauma > 0.3 && stepIdx > 6) {
-    if (cidx >= 200 && cidx < 300) T = trauma * 1.5;
-    if (cidx >= 450 && cidx < 550) T = trauma * 1.2;
-    if (cidx >= 930 && cidx < 1000) T = trauma * 1.0;
-  }
-
-  // wormhole: occasional category jump
-  let wormhole = 0;
-  if (Math.random() < 0.08 && stepIdx > 3 && stepIdx < 10) {
-    const jumpCat = Math.floor(Math.random() * 8);
-    if (cat === jumpCat) wormhole = 0.5;
-  }
-
-  // step-specific vibe
-  const vibes = [1.3, 1.1, 1.0, 0.9, 0.8, 0.7, 0.8, 0.9, 1.0, 0.8, 0.7, 1.4];
-  const vibe = vibes[stepIdx] || 1.0;
-  const tau = 0.7 + stepIdx * 0.08;
-
-  const score = (B * 8 + alphaMod * 0.3 * H + 0.15 * F + gammaMod * 0.25 * A + T + wormhole) * vibe / tau;
-  return score;
-}
-
-function selectWord(
-  context: string[],
-  prevWord: string | null,
-  stepIdx: number,
-  forbidden: Set<string>
-): string {
-  const scores: { word: string; score: number }[] = [];
-  for (const w of VOCAB) {
-    if (forbidden.has(w)) continue;
-    scores.push({ word: w, score: darioScore(w, context, prevWord, stepIdx) });
-  }
-
-  // add noise
-  const noise = 0.3 * (1 - stepIdx / STEPS);
-  for (const s of scores) s.score += Math.random() * noise;
-
-  scores.sort((a, b) => b.score - a.score);
-
-  const k = Math.min(12, scores.length);
-  const topk = scores.slice(0, k);
-  const total = topk.reduce((s, x) => s + Math.max(0, x.score), 0.001);
-  let r = Math.random() * total;
-  for (const t of topk) {
-    r -= Math.max(0, t.score);
-    if (r <= 0) return t.word;
-  }
-  return topk[0].word;
-}
-
-function extractKey(text: string): string {
-  const words = text.toLowerCase().replace(/[^a-z\s]/g, '').split(/\s+/)
-    .filter(w => w.length > 1 && !STOP_WORDS.has(w));
-  if (words.length === 0) return text.toLowerCase().split(/\s+/)[0] || "silence";
-  words.sort((a, b) => b.length - a.length || words.indexOf(b) - words.indexOf(a));
-  return words[0];
-}
-
-function findSeed(key: string): string {
-  const exact = VOCAB.find(w => w === key);
-  if (exact) return exact;
-
-  let best = "";
+function find_seed(key: string): number {
+  if (VOCAB_IDX.has(key)) return VOCAB_IDX.get(key)!;
+  let best = 0;
   let bestScore = -1;
-  for (const w of VOCAB) {
+  for (const [w, i] of VOCAB_IDX) {
     let score = 0;
     if (w.includes(key) || key.includes(w)) score = 3;
-    for (let i = 0; i < Math.min(w.length, key.length); i++) {
-      if (w[i] === key[i]) score += 0.5;
+    for (let k = 0; k < Math.min(w.length, key.length); k++) {
+      if (w[k] === key[k]) score += 0.5;
       else break;
     }
     if (score > bestScore) {
       bestScore = score;
-      best = w;
+      best = i;
     }
   }
-  if (best && bestScore > 0) return best;
-  return VOCAB[Math.floor(Math.random() * 200)]; // fallback
+  return bestScore > 0 ? best : Math.floor(Math.random() * 200);
 }
 
-function makeProphecy(seed: string): string {
-  const deepCats = [2, 5, 7]; // emotion, abstract, other
-  const targetCat = deepCats[Math.floor(Math.random() * deepCats.length)];
-  const catStart = [0, 100, 200, 300, 350, 450, 550, 650][targetCat] || 450;
-  const catEnd = [100, 200, 300, 350, 450, 550, 650, 1984][targetCat] || 550;
-  const idx = catStart + Math.floor(Math.random() * (catEnd - catStart));
-  return VOCAB[idx];
+
+function extract_key(text: string): string {
+  const words = text.toLowerCase().split(/\s+/).filter(w => w.length > 1 && !STOP.has(w));
+  if (words.length === 0) {
+    const parts = text.split(/\s+/);
+    return parts.length > 0 ? parts[0].toLowerCase() : "silence";
+  }
+  words.sort((a, b) => b.length - a.length);
+  return words[0];
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
 
-// ================================================================
-// UI & MAIN CHAIN
-// ================================================================
+function run_chain(model: Penelope, field: DarioField, text: string): number[] {
+  const key = extract_key(text);
+  const seed = find_seed(key);
 
-let running = false;
+  const deepCats = [2, 5, 7];
+  const tcat = deepCats[Math.floor(Math.random() * deepCats.length)];
+  const ranges: [number, number][] = [
+    [0, 100], [100, 200], [200, 300], [300, 350],
+    [350, 450], [450, 550], [550, 650], [650, V]
+  ];
+  const [s, e] = ranges[tcat];
+  field.prophecyTarget = Math.floor(Math.random() * (Math.min(e, V) - s)) + s;
+  field.prophecyAge = 0;
 
-async function runChain(userText: string) {
-  const column = document.getElementById('column');
-  const metrics = document.getElementById('metrics');
-  const prophecyEl = document.getElementById('prophecy');
-  const waiting = document.getElementById('waiting');
-  if (!column || !metrics || !prophecyEl || !waiting) return;
+  console.log(`\n  destined: ${VOCAB[field.prophecyTarget]}`);
+  console.log(`\n  ${VOCAB[seed]}`);
 
-  column.innerHTML = '';
-  metrics.classList.remove('visible');
-  prophecyEl.classList.remove('visible');
-  waiting.style.display = 'none';
-
-  const keyWord = extractKey(userText);
-  const seed = findSeed(keyWord);
-
-  const prophesied = makeProphecy(seed);
-  prophecyTarget = prophesied;
-  prophecyAge = 0;
-  prophecyEl.textContent = `destined: ${prophesied}`;
-  setTimeout(() => prophecyEl.classList.add('visible'), 300);
-
-  const inputWords = new Set(userText.toLowerCase().replace(/[^a-z\s]/g, '').split(/\s+/));
-  const forbidden = new Set([...inputWords, seed]);
-
-  // show seed
-  await showWord(column, seed, 'seed', 0);
-
-  const chain: string[] = [seed];
-  let prevWord = seed;
-  let totalDebt = 0;
+  const chain = [seed];
+  const forbidden = new Set([seed]);
 
   for (let step = 0; step < STEPS; step++) {
-    await sleep(1200 + step * 150);
-    updateChambers(step);
-    prophecyAge++;
+    field.updateChambers(step);
+    field.prophecyAge++;
 
-    const word = selectWord(chain, prevWord, step, forbidden);
-    chain.push(word);
-    forbidden.add(word);
+    // learned logits from step-specific weights
+    let logits = model.forwardStep(chain, step);
 
-    updateCooc(prevWord, word);
-    updateBigram(prevWord, word);
-    const widx = VOCAB.indexOf(word);
-    if (widx >= 0) {
-      const cat = wordCategory(widx);
-      destiny[cat] = 0.3 * 1 + 0.7 * destiny[cat];
+    // Dario field overlay
+    logits = field.overlay(logits, chain, step);
+
+    // mask forbidden
+    for (const f of forbidden) {
+      logits[f] = -1e9;
     }
 
-    if (word !== prophecyTarget) {
-      totalDebt += 0.1 * Math.log(1 + prophecyAge);
+    // top-k sampling
+    const probs = softmax(logits);
+    const indexed: [number, number][] = [];
+    for (let i = 0; i < probs.length; i++) indexed.push([i, probs[i]]);
+    indexed.sort((a, b) => b[1] - a[1]);
+    const topk = indexed.slice(0, 12);
+    let total = 0.001;
+    for (const [, p] of topk) total += Math.max(0, p);
+    let r = Math.random() * total;
+    let pick = topk[0][0];
+    for (const [idx, p] of topk) {
+      r -= Math.max(0, p);
+      if (r <= 0) {
+        pick = idx;
+        break;
+      }
+    }
+
+    chain.push(pick);
+    forbidden.add(pick);
+
+    // update field
+    if (chain.length >= 2) {
+      field.updateCooc(chain[chain.length - 2], pick);
+      const cat = word_category(pick);
+      field.destiny[cat] = 0.3 + 0.7 * field.destiny[cat];
+    }
+
+    if (step > 7) {
+      field.trauma = Math.min(1, field.trauma + 0.1);
+    }
+    field.trauma *= 0.97;
+
+    const marker = step === STEPS - 1 ? "  *" : "   ";
+    console.log(`${marker}${VOCAB[pick]}`);
+  }
+
+  const fulfilled = chain.includes(field.prophecyTarget!);
+  const cats = new Set(chain.map(w => word_category(w))).size;
+  console.log(`\n  drift ${cats}/8 · prophecy ${fulfilled ? "fulfilled" : "unfulfilled"}`);
+  return chain;
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// MAIN
+// ═══════════════════════════════════════════════════════════════
+
+function main(): void {
+  const args = process.argv.slice(2);
+  let trainPath: string | null = null;
+  let loadPath: string | null = null;
+  let savePath: string | null = null;
+  let trainSteps = 5000;
+  let lr = 3e-4;
+  let text: string | null = null;
+
+  let i = 0;
+  while (i < args.length) {
+    if (args[i] === "--train" && i + 1 < args.length) {
+      trainPath = args[i + 1]; i += 2;
+    } else if (args[i] === "--load" && i + 1 < args.length) {
+      loadPath = args[i + 1]; i += 2;
+    } else if (args[i] === "--save" && i + 1 < args.length) {
+      savePath = args[i + 1]; i += 2;
+    } else if (args[i] === "--steps" && i + 1 < args.length) {
+      trainSteps = parseInt(args[i + 1]); i += 2;
+    } else if (args[i] === "--lr" && i + 1 < args.length) {
+      lr = parseFloat(args[i + 1]); i += 2;
     } else {
-      totalDebt = Math.max(0, totalDebt - 1);
+      text = args.slice(i).join(" ");
+      break;
     }
-
-    if (step > 7) trauma = Math.min(1, trauma + 0.1);
-    trauma *= 0.97;
-
-    // ingest into field (cooc with recent context)
-    const recent = chain.slice(-4);
-    for (const ctx of recent) updateCooc(ctx, word);
-
-    const cls = step === STEPS - 1 ? 'final' : 'step';
-    await showWord(column, word, cls, step + 1);
-    prevWord = word;
   }
 
-  const fulfilled = chain.includes(prophecyTarget!);
+  const model = new Penelope();
+  const field = new DarioField();
 
-  await sleep(600);
-  const cats = chain.map(w => wordCategory(VOCAB.indexOf(w))).filter(c => c >= 0);
-  const uniqueCats = new Set(cats).size;
-  metrics.innerHTML = `debt ${totalDebt.toFixed(2)} · resonance ${(cooc.size / 100).toFixed(2)} · drift ${uniqueCats}/8 · prophecy ${fulfilled ? 'fulfilled' : 'unfulfilled'}`;
-  metrics.classList.add('visible');
+  console.log();
+  console.log(`  penelope — 1984 words, ${STEPS} steps, Dario Equation`);
+  console.log(`  ${model.paramCount().toLocaleString()} trainable params`);
+  console.log();
 
-  if (fulfilled) {
-    prophecyEl.textContent = `destined: ${prophesied} ✓`;
-  } else {
-    prophecyEl.textContent = `destined: ${prophesied} — unfulfilled`;
+  if (loadPath && fs.existsSync(loadPath)) {
+    model.load(loadPath);
+  }
+
+  if (trainPath) {
+    train(model, trainPath, trainSteps, lr);
+    if (savePath) {
+      model.save(savePath);
+    }
+  }
+
+  if (text) {
+    run_chain(model, field, text);
+  } else if (!trainPath) {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    const prompt = (): void => {
+      rl.question("  > ", (answer) => {
+        const trimmed = answer.trim();
+        if (!trimmed) {
+          prompt();
+          return;
+        }
+        run_chain(model, field, trimmed);
+        prompt();
+      });
+    };
+    prompt();
+  }
+
+  if (savePath && !trainPath) {
+    model.save(savePath);
   }
 }
 
-function showWord(container: HTMLElement, word: string, cls: string, stepNum: number): Promise<void> {
-  return new Promise(resolve => {
-    const div = document.createElement('div');
-    div.className = `word-line ${cls}`;
-    div.textContent = word;
-    container.appendChild(div);
-    div.scrollIntoView({ behavior: 'smooth', block: 'end' });
-    setTimeout(resolve, 100);
-  });
-}
-
-// ================================================================
-// BOOTSTRAP UI
-// ================================================================
-
-function initUI() {
-  const html = `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Penelope · TypeScript</title>
-  <style>
-    @import url('https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,700;1,400&display=swap');
-    :root {
-      --bg: #fafaf8;
-      --fg: #1a1a1a;
-      --dim: #777;
-      --ghost: #999;
-      --accent: #1a1a1a;
-      --serif: 'EB Garamond', Georgia, serif;
-    }
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      background: var(--bg);
-      color: var(--fg);
-      font-family: var(--serif);
-      height: 100vh;
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-    }
-    #logo {
-      position: fixed;
-      top: 24px;
-      left: 50%;
-      transform: translateX(-50%);
-      font-size: 11px;
-      letter-spacing: 8px;
-      text-transform: uppercase;
-      color: #888;
-      user-select: none;
-      font-weight: 500;
-    }
-    #eight {
-      position: fixed;
-      top: 18px;
-      right: 28px;
-      font-size: 22px;
-      color: #999;
-      font-weight: 700;
-      user-select: none;
-      opacity: 0.4;
-      letter-spacing: 2px;
-    }
-    #arena {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      justify-content: flex-end;
-      align-items: center;
-      padding: 80px 40px 120px;
-      overflow: hidden;
-    }
-    #prophecy {
-      position: fixed;
-      top: 60px;
-      left: 50%;
-      transform: translateX(-50%);
-      font-size: 12px;
-      font-style: italic;
-      color: var(--ghost);
-      letter-spacing: 2px;
-      opacity: 0;
-      transition: opacity 1.5s ease;
-      text-align: center;
-    }
-    #prophecy.visible { opacity: 1; }
-    #column {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 4px;
-      width: 100%;
-    }
-    .word-line {
-      font-size: 23px;
-      font-weight: 400;
-      letter-spacing: 1px;
-      opacity: 0;
-      transform: translateY(12px);
-      animation: word-arrive 0.8s ease forwards;
-      text-align: center;
-      line-height: 1.3;
-    }
-    .word-line.seed {
-      font-weight: 700;
-      font-size: 27px;
-      color: var(--accent);
-    }
-    .word-line.step { color: var(--fg); }
-    .word-line.final {
-      font-weight: 700;
-      font-size: 25px;
-      border-bottom: 1px solid var(--dim);
-      padding-bottom: 4px;
-    }
-    @keyframes word-arrive {
-      0% { opacity: 0; transform: translateY(12px); }
-      100% { opacity: 1; transform: translateY(0); }
-    }
-    #metrics {
-      position: fixed;
-      bottom: 68px;
-      left: 50%;
-      transform: translateX(-50%);
-      font-size: 10px;
-      letter-spacing: 2px;
-      color: var(--ghost);
-      text-align: center;
-      opacity: 0;
-      transition: opacity 1s ease;
-    }
-    #metrics.visible { opacity: 1; }
-    #input-bar {
-      position: fixed;
-      bottom: 0;
-      left: 0;
-      right: 0;
-      height: 56px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      border-top: 1px solid #ccc;
-      background: var(--bg);
-    }
-    #input-bar input {
-      background: none;
-      border: none;
-      border-bottom: 1px solid #bbb;
-      outline: none;
-      font-family: var(--serif);
-      font-size: 15px;
-      color: var(--fg);
-      text-align: center;
-      width: 400px;
-      letter-spacing: 0.5px;
-      padding-bottom: 2px;
-    }
-    #input-bar input::placeholder {
-      color: #999;
-      font-style: italic;
-    }
-    #input-bar input:focus {
-      border-bottom-color: var(--fg);
-    }
-    #send-btn {
-      background: none;
-      border: none;
-      cursor: pointer;
-      padding: 4px 8px;
-      margin-left: 8px;
-      color: #999;
-      font-size: 20px;
-      line-height: 1;
-      transition: color 0.2s ease;
-      user-select: none;
-    }
-    #send-btn:hover { color: var(--fg); }
-    #send-btn:active { color: var(--fg); transform: scale(0.9); }
-    #send-btn:disabled { opacity: 0.3; cursor: default; }
-    #waiting {
-      font-size: 14px;
-      color: var(--ghost);
-      font-style: italic;
-      letter-spacing: 1px;
-    }
-  </style>
-</head>
-<body>
-  <div id="logo">penelope</div>
-  <div id="eight">12</div>
-  <div id="prophecy"></div>
-  <div id="arena">
-    <div id="waiting">waiting</div>
-    <div id="column"></div>
-  </div>
-  <div id="metrics"></div>
-  <div id="input-bar">
-    <input type="text" id="input" placeholder="speak" autocomplete="off" spellcheck="false">
-    <button id="send-btn" aria-label="send">→</button>
-  </div>
-</body>
-</html>
-  `;
-
-  document.documentElement.innerHTML = html;
-
-  const input = document.getElementById('input') as HTMLInputElement;
-  const sendBtn = document.getElementById('send-btn') as HTMLButtonElement;
-
-  async function submit() {
-    if (running) return;
-    const text = input.value.trim();
-    if (!text) return;
-    input.value = '';
-    input.disabled = true;
-    sendBtn.disabled = true;
-    running = true;
-
-    await runChain(text);
-
-    running = false;
-    input.disabled = false;
-    sendBtn.disabled = false;
-    input.focus();
-  }
-
-  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
-  sendBtn.addEventListener('click', submit);
-  input.focus();
-}
-
-// ================================================================
-// START
-// ================================================================
-
-if (typeof window !== 'undefined') {
-  window.onload = initUI;
-}
-
-export {}; // make it a module
+main();
