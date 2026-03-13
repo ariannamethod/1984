@@ -349,9 +349,25 @@ typedef struct {
     float *w_down;  /* [HDIM * DIM] SwiGLU down */
 } StepWeights;
 
+/* Adam first/second moment buffers (same layout as StepWeights) */
+typedef struct {
+    float *wr_m, *wr_v;
+    float *rms_m, *rms_v;
+    float *gate_m, *gate_v;
+    float *up_m, *up_v;
+    float *down_m, *down_v;
+} StepAdam;
+
+#define ADAM_B1  0.9f
+#define ADAM_B2  0.999f
+#define ADAM_EPS 1e-8f
+
 typedef struct {
     float *embed;   /* [NWORDS * DIM] shared embedding */
+    float *embed_m, *embed_v;  /* Adam moments for embed */
     StepWeights steps[NSTEPS];
+    StepAdam    adam[NSTEPS];  /* Adam moments per step */
+    int adam_t;               /* Adam timestep counter */
 } Model;
 
 static int step_param_count(void) {
@@ -364,22 +380,37 @@ static int total_param_count(void) {
 
 static void model_init(Model *m) {
     int embed_sz = NWORDS * DIM;
-    int spc = step_param_count();
     float scale_d = sqrtf(2.0f / DIM);
     float scale_v = sqrtf(2.0f / NWORDS);
     float scale_m = sqrtf(2.0f / HDIM);
 
-    m->embed = (float *)malloc(embed_sz * sizeof(float));
+    m->embed   = (float *)malloc(embed_sz * sizeof(float));
+    m->embed_m = (float *)calloc(embed_sz, sizeof(float));
+    m->embed_v = (float *)calloc(embed_sz, sizeof(float));
+    m->adam_t  = 0;
     for (int i = 0; i < embed_sz; i++)
         m->embed[i] = randn() * scale_v;
 
     for (int s = 0; s < NSTEPS; s++) {
         StepWeights *sw = &m->steps[s];
+        StepAdam *sa = &m->adam[s];
         sw->wr     = (float *)malloc(DIM * DIM * sizeof(float));
         sw->rms    = (float *)malloc(DIM * sizeof(float));
         sw->w_gate = (float *)malloc(DIM * HDIM * sizeof(float));
         sw->w_up   = (float *)malloc(DIM * HDIM * sizeof(float));
         sw->w_down = (float *)malloc(HDIM * DIM * sizeof(float));
+
+        /* Adam moment buffers (calloc = zero-initialized) */
+        sa->wr_m   = (float *)calloc(DIM * DIM, sizeof(float));
+        sa->wr_v   = (float *)calloc(DIM * DIM, sizeof(float));
+        sa->rms_m  = (float *)calloc(DIM, sizeof(float));
+        sa->rms_v  = (float *)calloc(DIM, sizeof(float));
+        sa->gate_m = (float *)calloc(DIM * HDIM, sizeof(float));
+        sa->gate_v = (float *)calloc(DIM * HDIM, sizeof(float));
+        sa->up_m   = (float *)calloc(DIM * HDIM, sizeof(float));
+        sa->up_v   = (float *)calloc(DIM * HDIM, sizeof(float));
+        sa->down_m = (float *)calloc(HDIM * DIM, sizeof(float));
+        sa->down_v = (float *)calloc(HDIM * DIM, sizeof(float));
 
         for (int i = 0; i < DIM*DIM; i++) sw->wr[i] = randn() * scale_d;
         for (int i = 0; i < DIM; i++) sw->rms[i] = 1.0f;
@@ -390,13 +421,32 @@ static void model_init(Model *m) {
 }
 
 static void model_free(Model *m) {
-    free(m->embed);
+    free(m->embed); free(m->embed_m); free(m->embed_v);
     for (int s = 0; s < NSTEPS; s++) {
-        free(m->steps[s].wr);
-        free(m->steps[s].rms);
-        free(m->steps[s].w_gate);
-        free(m->steps[s].w_up);
-        free(m->steps[s].w_down);
+        free(m->steps[s].wr); free(m->steps[s].rms);
+        free(m->steps[s].w_gate); free(m->steps[s].w_up); free(m->steps[s].w_down);
+        StepAdam *sa = &m->adam[s];
+        free(sa->wr_m); free(sa->wr_v); free(sa->rms_m); free(sa->rms_v);
+        free(sa->gate_m); free(sa->gate_v); free(sa->up_m); free(sa->up_v);
+        free(sa->down_m); free(sa->down_v);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * ADAM OPTIMIZER — from Chuck (kirby.c lineage)
+ * β₁=0.9, β₂=0.999, bias correction, no weight decay
+ * ═══════════════════════════════════════════════════════════════ */
+
+static void adam_update(float *w, float *am, float *av, float *grad,
+                        int n, float lr, float bc1, float bc2) {
+    for (int i = 0; i < n; i++) {
+        float g = grad[i];
+        am[i] = ADAM_B1 * am[i] + (1 - ADAM_B1) * g;
+        av[i] = ADAM_B2 * av[i] + (1 - ADAM_B2) * g * g;
+        float mhat = am[i] / bc1;
+        float vhat = av[i] / bc2;
+        w[i] -= lr * mhat / (sqrtf(vhat) + ADAM_EPS);
+        grad[i] = 0;  /* clear gradient */
     }
 }
 
@@ -673,6 +723,7 @@ static void train(Model *m, const char *data_path, int train_steps, float lr) {
 
     printf("  corpus: %ld bytes -> %d vocab words\n", fsz, n_ids);
     printf("  model: %d params (%.1fMB f32)\n", total_param_count(), total_param_count() * 4.0f / 1e6);
+    printf("  optimizer: Adam (Chuck lineage) b1=%.1f b2=%.3f\n", ADAM_B1, ADAM_B2);
     printf("  training: %d steps, lr=%.1e\n", train_steps, lr);
 
     /* alloc scratch buffers */
@@ -690,6 +741,16 @@ static void train(Model *m, const char *data_path, int train_steps, float lr) {
     float *d_swiglu= (float *)malloc(HDIM * sizeof(float));
     float *ctx     = (float *)malloc(DIM * sizeof(float));
 
+    /* gradient accumulators per step */
+    float *g_embed = (float *)calloc(NWORDS * DIM, sizeof(float));
+    float *g_wr[NSTEPS], *g_gate[NSTEPS], *g_up[NSTEPS], *g_down[NSTEPS];
+    for (int s = 0; s < NSTEPS; s++) {
+        g_wr[s]   = (float *)calloc(DIM * DIM, sizeof(float));
+        g_gate[s] = (float *)calloc(DIM * HDIM, sizeof(float));
+        g_up[s]   = (float *)calloc(DIM * HDIM, sizeof(float));
+        g_down[s] = (float *)calloc(HDIM * DIM, sizeof(float));
+    }
+
     float best_loss = 1e9f;
 
     for (int step = 1; step <= train_steps; step++) {
@@ -697,6 +758,15 @@ static void train(Model *m, const char *data_path, int train_steps, float lr) {
         int *win = ids + start;
 
         float total_loss = 0;
+
+        /* zero grad accumulators */
+        memset(g_embed, 0, NWORDS * DIM * sizeof(float));
+        for (int s = 0; s < NSTEPS; s++) {
+            memset(g_wr[s], 0, DIM * DIM * sizeof(float));
+            memset(g_gate[s], 0, DIM * HDIM * sizeof(float));
+            memset(g_up[s], 0, DIM * HDIM * sizeof(float));
+            memset(g_down[s], 0, HDIM * DIM * sizeof(float));
+        }
 
         for (int s = 0; s < NSTEPS; s++) {
             int ctx_n = s + 1;
@@ -723,20 +793,20 @@ static void train(Model *m, const char *data_path, int train_steps, float lr) {
                 d_out[j] = s_val;
             }
 
-            /* update embedding (SGD on tied weights) */
+            /* accumulate embed gradient */
             for (int v = 0; v < NWORDS; v++) {
                 if (fabsf(d_logits[v]) < 1e-8f) continue;
                 for (int j = 0; j < DIM; j++)
-                    m->embed[v * DIM + j] -= lr * d_logits[v] * out[j];
+                    g_embed[v * DIM + j] += d_logits[v] * out[j];
             }
 
-            /* backprop through w_down */
+            /* backprop through w_down — accumulate */
             matmul_mtv(sw->w_down, d_out, d_swiglu, DIM, HDIM);
             for (int i = 0; i < HDIM; i++)
                 for (int j = 0; j < DIM; j++)
-                    sw->w_down[i * DIM + j] -= lr * swiglu[i] * d_out[j];
+                    g_down[s][i * DIM + j] += swiglu[i] * d_out[j];
 
-            /* backprop through SwiGLU */
+            /* backprop through SwiGLU — accumulate */
             for (int i = 0; i < HDIM; i++) {
                 float sg = siluf(gate[i]);
                 float sig = (gate[i] > -20) ? 1.0f / (1.0f + expf(-gate[i])) : 0;
@@ -745,12 +815,12 @@ static void train(Model *m, const char *data_path, int train_steps, float lr) {
                 float d_up_i = d_swiglu[i] * sg;
 
                 for (int j = 0; j < DIM; j++) {
-                    sw->w_gate[i * DIM + j] -= lr * d_gate_i * query_n[j];
-                    sw->w_up[i * DIM + j] -= lr * d_up_i * query_n[j];
+                    g_gate[s][i * DIM + j] += d_gate_i * query_n[j];
+                    g_up[s][i * DIM + j] += d_up_i * query_n[j];
                 }
             }
 
-            /* d_query_n (skip full RMSNorm backward, approximate) */
+            /* d_query (approx RMSNorm backward) */
             float ss = 0;
             for (int i = 0; i < DIM; i++) ss += query[i] * query[i];
             ss = ss / DIM + 1e-5f;
@@ -759,13 +829,33 @@ static void train(Model *m, const char *data_path, int train_steps, float lr) {
             for (int i = 0; i < DIM; i++)
                 d_query[i] = d_out[i] * sw->rms[i] * inv;
 
-            /* update Wr */
+            /* accumulate Wr gradient */
             pool_context(m, win, ctx_n, ctx);
             for (int i = 0; i < DIM; i++) {
                 if (fabsf(d_query[i]) < 1e-8f) continue;
                 for (int j = 0; j < DIM; j++)
-                    sw->wr[i * DIM + j] -= lr * d_query[i] * ctx[j];
+                    g_wr[s][i * DIM + j] += d_query[i] * ctx[j];
             }
+        }
+
+        /* ═══ Adam step (Chuck optimizer) ═══ */
+        m->adam_t++;
+        float bc1 = 1.0f - powf(ADAM_B1, (float)m->adam_t);
+        float bc2 = 1.0f - powf(ADAM_B2, (float)m->adam_t);
+
+        adam_update(m->embed, m->embed_m, m->embed_v, g_embed,
+                    NWORDS * DIM, lr, bc1, bc2);
+
+        for (int s = 0; s < NSTEPS; s++) {
+            StepAdam *sa = &m->adam[s];
+            adam_update(m->steps[s].wr,     sa->wr_m,   sa->wr_v,   g_wr[s],
+                        DIM*DIM, lr, bc1, bc2);
+            adam_update(m->steps[s].w_gate, sa->gate_m, sa->gate_v, g_gate[s],
+                        DIM*HDIM, lr, bc1, bc2);
+            adam_update(m->steps[s].w_up,   sa->up_m,   sa->up_v,   g_up[s],
+                        DIM*HDIM, lr, bc1, bc2);
+            adam_update(m->steps[s].w_down, sa->down_m, sa->down_v, g_down[s],
+                        HDIM*DIM, lr, bc1, bc2);
         }
 
         float avg_loss = total_loss / NSTEPS;
@@ -779,7 +869,10 @@ static void train(Model *m, const char *data_path, int train_steps, float lr) {
 
     free(ids); free(logits); free(probs); free(d_logits); free(d_out);
     free(query); free(query_n); free(gate); free(up); free(swiglu);
-    free(hidden); free(out); free(d_swiglu); free(ctx);
+    free(hidden); free(out); free(d_swiglu); free(ctx); free(g_embed);
+    for (int s = 0; s < NSTEPS; s++) {
+        free(g_wr[s]); free(g_gate[s]); free(g_up[s]); free(g_down[s]);
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════
