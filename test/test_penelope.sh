@@ -148,6 +148,40 @@ fi
 
 rm -f penelope_test_bin
 
+# ─── AML (AriannaMethod Language) ───
+echo ""
+echo "  --- AML (AriannaMethod Language) ---"
+
+if cc ariannamethod/ariannamethod.c -o amlc_test_bin 2>/dev/null; then
+    pass "amlc compiler builds"
+    if ./amlc_test_bin penelope.aml -o penelope_aml_test_bin 2>/dev/null; then
+        pass "penelope.aml compiles"
+        # run and check output
+        AML_OUT=$(timeout 30 ./penelope_aml_test_bin "darkness eats" 2>&1 || true)
+        if echo "$AML_OUT" | grep -q "1984 words"; then
+            pass "AML: prints '1984 words'"
+        else
+            fail "AML: missing '1984 words'"
+        fi
+        if echo "$AML_OUT" | grep -q "13152768"; then
+            pass "AML: param count = 13,152,768"
+        else
+            fail "AML: param count mismatch"
+        fi
+        if echo "$AML_OUT" | grep -q "destined:"; then
+            pass "AML: shows prophecy target"
+        else
+            fail "AML: missing prophecy target"
+        fi
+        rm -f penelope_aml_test_bin
+    else
+        fail "penelope.aml compile"
+    fi
+    rm -f amlc_test_bin
+else
+    echo "  SKIP: cc not found"
+fi
+
 echo ""
 echo "  ═══════════════════════════════════════"
 echo "  $PASS passed, $FAIL failed"
