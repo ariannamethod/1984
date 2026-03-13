@@ -1,7 +1,11 @@
 penelope
+penelope_aml
 penelope_test_bin
 penelope_rs_test
+amlc
+ariannamethod/amlc
 test/test_penelope_bin
 test/test_penelope_zig
+test/test_penelope_aml
 *.o
 *.bin
