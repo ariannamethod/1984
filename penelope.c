@@ -280,7 +280,7 @@ static const char *VOCAB[NWORDS] = {
 "margin","periphery","frontier","borderland","hinterland","interior","core","nucleus","membrane","skin",
 "permission","prohibition","transgression","taboo","norm","deviation","exception","precedent","custom","habit",
 "witness","testimony","evidence","proof","alibi","verdict","appeal","clemency","execution","reprieve",
-"debt","credit","interest","principal","collateral","default","bankruptcy","solvency","dividend","investment",
+"debt","credit","interest","principal",
 };
 
 /* ═══════════════════════════════════════════════════════════════

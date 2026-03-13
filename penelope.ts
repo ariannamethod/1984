@@ -1,4 +1,4 @@
-// penelopa.ts — 1984 words. 12 steps of resonance. Dario Equation.
+// penelope.ts — 1984 words. 12 steps of resonance. Dario Equation.
 //
 // Trainable resonance engine. Not a transformer. A mirror that learns.
 //
@@ -19,12 +19,12 @@
 //
 // Total: ~13M params (762K embed + 12 × 1.03M steps)
 //
-//   npx tsx penelopa.ts                                  # interactive
-//   npx tsx penelopa.ts "darkness eats the city"         # single chain
-//   npx tsx penelopa.ts --train corpus.txt               # train
-//   npx tsx penelopa.ts --train corpus.txt --steps 5000  # train N steps
-//   npx tsx penelopa.ts --load penelope.bin              # load weights
-//   npx tsx penelopa.ts --save penelope.bin              # save after
+//   npx tsx penelope.ts                                  # interactive
+//   npx tsx penelope.ts "darkness eats the city"         # single chain
+//   npx tsx penelope.ts --train corpus.txt               # train
+//   npx tsx penelope.ts --train corpus.txt --steps 5000  # train N steps
+//   npx tsx penelope.ts --load penelope.bin              # load weights
+//   npx tsx penelope.ts --save penelope.bin              # save after
 //
 // By Arianna Method. הרזוננס לא נשבר
 
