@@ -1,19 +1,34 @@
 /*
  * penelope.c — 1984 words. 12 steps of resonance. Dario Equation.
  *
- * Weightless resonance engine. Not a neural network. A mirror.
- * Co-occurrence IS the weight. Repetition IS learning.
+ * Trainable resonance engine. Not a transformer. A mirror that learns.
  *
- *   score(w) = B + α·H + β·F + γ·A + T
- *       B = bigram affinity (positional pattern, RRPRAM-like)
- *       H = Hebbian co-occurrence with context
- *       F = prophecy fulfillment pressure
- *       A = destiny attraction (category compass)
- *       T = trauma gravity
+ * Input:  text → vocab word IDs (prefix matching)
+ * Attend: RRPRAM resonance + SwiGLU per step (how it thinks)
+ * Output: word-level from 1984 vocab (gibberish impossible)
+ *
+ * 12 learned step-weights (~1.03M each). Each step has its own lens.
+ * Step 1 sees the surface. Step 12 sees the bone.
+ *
+ * Architecture per step s:
+ *     context = pool(embed(words))
+ *     query   = RMSNorm(context @ Wr_s)          RRPRAM resonance
+ *     hidden  = SwiGLU(query; gate_s, up_s, down_s)
+ *     logits  = (query + hidden) @ E^T            tied output
+ *     logits += DarioField(context)               live overlay
+ *     word    = sample(softmax(logits))
+ *
+ * Total: ~13M params (762K embed + 12 × 1.03M steps)
+ *
+ *   score(w) = B + α·H + β·F + γ·A + T      (Dario Equation)
  *
  *   cc penelope.c -O2 -lm -o penelope
- *   ./penelope                          # interactive
- *   ./penelope "darkness eats the city" # single chain
+ *   ./penelope                                  # interactive
+ *   ./penelope "darkness eats the city"         # single chain
+ *   ./penelope --train corpus.txt               # train 5000 steps
+ *   ./penelope --train corpus.txt --steps 1000  # train N steps
+ *   ./penelope --load penelope.bin              # load weights
+ *   ./penelope --save penelope.bin              # save after
  *
  * By Arianna Method. הרזוננס לא נשבר
  */
@@ -26,7 +41,9 @@
 #include <ctype.h>
 
 #define NWORDS   1984
-#define STEPS    12
+#define NSTEPS   12
+#define DIM      384
+#define HDIM     768
 #define MAX_COOC 32768
 #define MAX_BIG  16384
 #define MAX_CTX  64
@@ -304,7 +321,213 @@ static int word_category(int idx) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
- * DARIO FIELD
+ * MATH UTILS
+ * ═══════════════════════════════════════════════════════════════ */
+
+static float randf(void) { return (float)rand() / (float)RAND_MAX; }
+static float clampf(float x, float lo, float hi) { return x<lo?lo:(x>hi?hi:x); }
+
+static float randn(void) {
+    float u1 = randf() + 1e-12f;
+    float u2 = randf() + 1e-12f;
+    return sqrtf(-2.0f * logf(u1)) * cosf(6.2831853f * u2);
+}
+
+static float siluf(float x) {
+    return (x > -20.0f) ? x / (1.0f + expf(-x)) : 0.0f;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * TRAINABLE MODEL — 12 step-specific weight sets + shared embed
+ * ═══════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    float *wr;      /* [DIM * DIM]  RRPRAM resonance */
+    float *rms;     /* [DIM]        RMSNorm gain */
+    float *w_gate;  /* [DIM * HDIM] SwiGLU gate */
+    float *w_up;    /* [DIM * HDIM] SwiGLU up */
+    float *w_down;  /* [HDIM * DIM] SwiGLU down */
+} StepWeights;
+
+typedef struct {
+    float *embed;   /* [NWORDS * DIM] shared embedding */
+    StepWeights steps[NSTEPS];
+} Model;
+
+static int step_param_count(void) {
+    return DIM*DIM + DIM + DIM*HDIM + DIM*HDIM + HDIM*DIM;
+}
+
+static int total_param_count(void) {
+    return NWORDS * DIM + NSTEPS * step_param_count();
+}
+
+static void model_init(Model *m) {
+    int embed_sz = NWORDS * DIM;
+    int spc = step_param_count();
+    float scale_d = sqrtf(2.0f / DIM);
+    float scale_v = sqrtf(2.0f / NWORDS);
+    float scale_m = sqrtf(2.0f / HDIM);
+
+    m->embed = (float *)malloc(embed_sz * sizeof(float));
+    for (int i = 0; i < embed_sz; i++)
+        m->embed[i] = randn() * scale_v;
+
+    for (int s = 0; s < NSTEPS; s++) {
+        StepWeights *sw = &m->steps[s];
+        sw->wr     = (float *)malloc(DIM * DIM * sizeof(float));
+        sw->rms    = (float *)malloc(DIM * sizeof(float));
+        sw->w_gate = (float *)malloc(DIM * HDIM * sizeof(float));
+        sw->w_up   = (float *)malloc(DIM * HDIM * sizeof(float));
+        sw->w_down = (float *)malloc(HDIM * DIM * sizeof(float));
+
+        for (int i = 0; i < DIM*DIM; i++) sw->wr[i] = randn() * scale_d;
+        for (int i = 0; i < DIM; i++) sw->rms[i] = 1.0f;
+        for (int i = 0; i < DIM*HDIM; i++) sw->w_gate[i] = randn() * scale_d;
+        for (int i = 0; i < DIM*HDIM; i++) sw->w_up[i] = randn() * scale_d;
+        for (int i = 0; i < HDIM*DIM; i++) sw->w_down[i] = randn() * scale_m;
+    }
+}
+
+static void model_free(Model *m) {
+    free(m->embed);
+    for (int s = 0; s < NSTEPS; s++) {
+        free(m->steps[s].wr);
+        free(m->steps[s].rms);
+        free(m->steps[s].w_gate);
+        free(m->steps[s].w_up);
+        free(m->steps[s].w_down);
+    }
+}
+
+static void model_save(Model *m, const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "  cannot open %s for writing\n", path); return; }
+    int header[4] = { NWORDS, DIM, HDIM, NSTEPS };
+    fwrite(header, sizeof(int), 4, f);
+    fwrite(m->embed, sizeof(float), NWORDS * DIM, f);
+    for (int s = 0; s < NSTEPS; s++) {
+        StepWeights *sw = &m->steps[s];
+        fwrite(sw->wr, sizeof(float), DIM*DIM, f);
+        fwrite(sw->rms, sizeof(float), DIM, f);
+        fwrite(sw->w_gate, sizeof(float), DIM*HDIM, f);
+        fwrite(sw->w_up, sizeof(float), DIM*HDIM, f);
+        fwrite(sw->w_down, sizeof(float), HDIM*DIM, f);
+    }
+    fclose(f);
+    /* verify */
+    FILE *check = fopen(path, "rb");
+    fseek(check, 0, SEEK_END);
+    long sz = ftell(check);
+    fclose(check);
+    int expected = 16 + total_param_count() * 4;
+    printf("  saved %s: %d params (%.1fMB) [%s]\n", path, total_param_count(),
+           sz / 1e6, sz == expected ? "OK" : "SIZE MISMATCH!");
+}
+
+static int model_load(Model *m, const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "  cannot open %s\n", path); return 0; }
+    int header[4];
+    fread(header, sizeof(int), 4, f);
+    if (header[0] != NWORDS || header[1] != DIM || header[2] != HDIM || header[3] != NSTEPS) {
+        fprintf(stderr, "  config mismatch: V=%d D=%d M=%d S=%d\n",
+                header[0], header[1], header[2], header[3]);
+        fclose(f);
+        return 0;
+    }
+    fread(m->embed, sizeof(float), NWORDS * DIM, f);
+    for (int s = 0; s < NSTEPS; s++) {
+        StepWeights *sw = &m->steps[s];
+        fread(sw->wr, sizeof(float), DIM*DIM, f);
+        fread(sw->rms, sizeof(float), DIM, f);
+        fread(sw->w_gate, sizeof(float), DIM*HDIM, f);
+        fread(sw->w_up, sizeof(float), DIM*HDIM, f);
+        fread(sw->w_down, sizeof(float), HDIM*DIM, f);
+    }
+    fclose(f);
+    printf("  loaded %s: %d params\n", path, total_param_count());
+    return 1;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * FORWARD — one step produces logits[NWORDS]
+ * ═══════════════════════════════════════════════════════════════ */
+
+static void pool_context(Model *m, int *ids, int n, float *ctx) {
+    for (int j = 0; j < DIM; j++) ctx[j] = 0;
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < DIM; j++)
+            ctx[j] += m->embed[ids[i] * DIM + j];
+    float inv = 1.0f / (n > 0 ? n : 1);
+    for (int j = 0; j < DIM; j++) ctx[j] *= inv;
+}
+
+static void matmul_mv(float *W, float *x, float *out, int rows, int cols) {
+    for (int i = 0; i < rows; i++) {
+        float s = 0;
+        for (int j = 0; j < cols; j++)
+            s += W[i * cols + j] * x[j];
+        out[i] = s;
+    }
+}
+
+static void matmul_mtv(float *W, float *x, float *out, int rows, int cols) {
+    /* W^T @ x: W[rows,cols], x[rows] -> out[cols] */
+    for (int j = 0; j < cols; j++) {
+        float s = 0;
+        for (int i = 0; i < rows; i++)
+            s += W[i * cols + j] * x[i];
+        out[j] = s;
+    }
+}
+
+static void rmsnorm(float *x, float *g, float *out, int n) {
+    float ss = 0;
+    for (int i = 0; i < n; i++) ss += x[i] * x[i];
+    ss = ss / n + 1e-5f;
+    float inv = 1.0f / sqrtf(ss);
+    for (int i = 0; i < n; i++) out[i] = g[i] * x[i] * inv;
+}
+
+static void forward_step(Model *m, int *ctx_ids, int ctx_n, int step_idx,
+                          float *logits, float *query, float *query_n,
+                          float *gate, float *up, float *swiglu, float *hidden, float *out) {
+    StepWeights *sw = &m->steps[step_idx];
+    float ctx[DIM];
+    pool_context(m, ctx_ids, ctx_n, ctx);
+
+    /* RRPRAM: query = ctx @ Wr */
+    matmul_mv(sw->wr, ctx, query, DIM, DIM);
+    /* RMSNorm */
+    rmsnorm(query, sw->rms, query_n, DIM);
+    /* SwiGLU */
+    matmul_mv(sw->w_gate, query_n, gate, HDIM, DIM);
+    matmul_mv(sw->w_up, query_n, up, HDIM, DIM);
+    for (int i = 0; i < HDIM; i++)
+        swiglu[i] = siluf(gate[i]) * up[i];
+    matmul_mv(sw->w_down, swiglu, hidden, DIM, HDIM);
+    /* Residual */
+    for (int i = 0; i < DIM; i++)
+        out[i] = query_n[i] + hidden[i];
+    /* Logits = E @ out (tied weights): logits[v] = sum_j E[v,j]*out[j] */
+    matmul_mv(m->embed, out, logits, NWORDS, DIM);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * SOFTMAX
+ * ═══════════════════════════════════════════════════════════════ */
+
+static void softmax_v(float *x, float *out, int n) {
+    float mx = x[0];
+    for (int i = 1; i < n; i++) if (x[i] > mx) mx = x[i];
+    float s = 0;
+    for (int i = 0; i < n; i++) { out[i] = expf(x[i] - mx); s += out[i]; }
+    for (int i = 0; i < n; i++) out[i] /= s;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * DARIO FIELD — live heuristic overlay
  * ═══════════════════════════════════════════════════════════════ */
 
 typedef struct { int a, b; float val; } CoocEntry;
@@ -318,22 +541,17 @@ static float       destiny[8] = {0};
 static float       trauma = 0;
 static int         prophecy_target = -1;
 static int         prophecy_age = 0;
-static int         total_steps = 0;
 
-/* chambers */
+/* Kuramoto chambers */
 enum { CH_FEAR=0, CH_LOVE, CH_RAGE, CH_VOID, CH_FLOW, CH_COMPLEX, NCH };
 static float chambers[NCH] = {0};
 static const float ch_decay[NCH] = {0.95f, 0.95f, 0.93f, 0.96f, 0.94f, 0.97f};
-
-static float randf(void) { return (float)rand() / (float)RAND_MAX; }
-static float clampf(float x, float lo, float hi) { return x<lo?lo:(x>hi?hi:x); }
 
 static void cooc_update(int a, int b) {
     if (a > b) { int t=a; a=b; b=t; }
     for (int i = 0; i < cooc_n; i++)
         if (cooc[i].a == a && cooc[i].b == b) { cooc[i].val += 1.0f; return; }
-    if (cooc_n < MAX_COOC)
-        cooc[cooc_n++] = (CoocEntry){a, b, 1.0f};
+    if (cooc_n < MAX_COOC) cooc[cooc_n++] = (CoocEntry){a, b, 1.0f};
 }
 
 static float cooc_get(int a, int b) {
@@ -343,28 +561,8 @@ static float cooc_get(int a, int b) {
     return 0;
 }
 
-static void bigram_update(int prev, int next) {
-    for (int i = 0; i < big_n; i++)
-        if (bigs[i].prev == prev && bigs[i].next == next) { bigs[i].val += 1.0f; return; }
-    if (big_n < MAX_BIG)
-        bigs[big_n++] = (BigramEntry){prev, next, 1.0f};
-}
-
-static float bigram_get(int prev, int next) {
-    for (int i = 0; i < big_n; i++)
-        if (bigs[i].prev == prev && bigs[i].next == next) return bigs[i].val;
-    return 0;
-}
-
-static float bigram_max(int prev) {
-    float mx = 0;
-    for (int i = 0; i < big_n; i++)
-        if (bigs[i].prev == prev && bigs[i].val > mx) mx = bigs[i].val;
-    return mx;
-}
-
 static void update_chambers(int step_idx) {
-    float depth = (float)step_idx / STEPS;
+    float depth = (float)step_idx / NSTEPS;
     int phase = depth < 0.33f ? 0 : (depth < 0.66f ? 1 : 2);
     if (phase == 0) chambers[CH_FLOW] += 0.05f;
     if (phase == 1) chambers[CH_FEAR] += 0.04f;
@@ -377,99 +575,216 @@ static void update_chambers(int step_idx) {
     for (int i = 0; i < NCH; i++)
         for (int j = 0; j < NCH; j++)
             if (i != j) chambers[i] += K * sinf(old[j] - old[i]);
-
     for (int i = 0; i < NCH; i++)
         chambers[i] = clampf(chambers[i] * ch_decay[i], 0, 1);
 }
 
-/* ═══════════════════════════════════════════════════════════════
- * DARIO EQUATION
- * ═══════════════════════════════════════════════════════════════ */
-
-static float dario_score(int cand, const int *ctx, int ctx_n, int prev, int step) {
+static void dario_overlay(float *logits, int *ctx, int ctx_n, int step) {
     float alpha_mod = 1 + 0.3f*chambers[CH_LOVE] - 0.2f*chambers[CH_RAGE] + 0.1f*chambers[CH_FLOW];
-    float beta_mod  = 1 + 0.2f*chambers[CH_FLOW] - 0.3f*chambers[CH_FEAR];
     float gamma_mod = 1 + 0.4f*chambers[CH_VOID] + 0.2f*chambers[CH_COMPLEX];
 
-    /* B: bigram */
-    float B = 0;
-    if (prev >= 0) {
-        float mx = bigram_max(prev);
-        B = bigram_get(prev, cand) / (mx + 1);
+    int last_n = ctx_n > 8 ? 8 : ctx_n;
+    int start = ctx_n - last_n;
+
+    for (int v = 0; v < NWORDS; v++) {
+        /* H: Hebbian co-occurrence */
+        float H = 0;
+        for (int i = start; i < ctx_n; i++)
+            H += cooc_get(ctx[i], v);
+        if (H > 1) H = 1;
+        logits[v] += alpha_mod * 0.3f * H;
+
+        /* F: prophecy */
+        if (prophecy_target >= 0 && v == prophecy_target)
+            logits[v] += 0.5f * logf(1.0f + prophecy_age);
+
+        /* A: destiny */
+        int cat = word_category(v);
+        float d_max = 0.01f;
+        for (int i = 0; i < 8; i++) if (fabsf(destiny[i]) > d_max) d_max = fabsf(destiny[i]);
+        logits[v] += gamma_mod * 0.25f * destiny[cat] / d_max;
     }
-
-    /* H: Hebbian */
-    float H = 0;
-    for (int i = 0; i < ctx_n; i++)
-        H += cooc_get(ctx[i], cand) * (1.0f / (ctx_n - i + 1));
-    if (H > 1) H = 1;
-
-    /* F: prophecy */
-    float F = 0;
-    if (prophecy_target >= 0 && cand == prophecy_target)
-        F = 0.5f * logf(1.0f + prophecy_age);
-
-    /* A: destiny */
-    int cat = word_category(cand);
-    float d_max = 0.01f;
-    for (int i = 0; i < 8; i++) if (fabsf(destiny[i]) > d_max) d_max = fabsf(destiny[i]);
-    float A = destiny[cat] / d_max;
-
-    /* T: trauma */
-    float T = 0;
-    if (trauma > 0.3f && step > 6) {
-        if (cand >= 200 && cand < 300) T = trauma * 1.5f;
-        else if (cand >= 450 && cand < 550) T = trauma * 1.2f;
-        else if (cand >= 930 && cand < 1000) T = trauma * 1.0f;
-    }
-
-    /* wormhole */
-    float worm = 0;
-    if (randf() < 0.08f && step > 3 && step < 10)
-        if (cat == rand() % 8) worm = 0.5f;
-
-    float vibes[] = {1.3f,1.1f,1.0f,0.9f,0.8f,0.7f,0.8f,0.9f,1.0f,0.8f,0.7f,1.4f};
-    float vibe = (step < 12) ? vibes[step] : 1.0f;
-    float tau = 0.7f + step * 0.08f;
-
-    return (B*8 + alpha_mod*0.3f*H + beta_mod*0.15f*F +
-            gamma_mod*0.25f*A + T + worm) * vibe / tau;
 }
 
 /* ═══════════════════════════════════════════════════════════════
- * SELECT + CHAIN
+ * TOKENIZE — extract vocab word IDs from text
  * ═══════════════════════════════════════════════════════════════ */
 
-static int select_word(const int *ctx, int ctx_n, int prev, int step, const int *forbidden, int nforbid) {
-    typedef struct { int idx; float score; } Sc;
-    static Sc scores[NWORDS];
+static int tokenize_text(const char *text, int *ids, int max_ids) {
+    char buf[4096];
+    int bi = 0;
+    for (int i = 0; text[i] && bi < 4094; i++)
+        buf[bi++] = tolower(text[i]);
+    buf[bi] = 0;
+
     int n = 0;
-
-    float noise = 0.3f * (1.0f - (float)step / STEPS);
-
-    for (int w = 0; w < NWORDS; w++) {
-        int skip = 0;
-        for (int f = 0; f < nforbid; f++) if (forbidden[f] == w) { skip = 1; break; }
-        if (skip) continue;
-        scores[n++] = (Sc){w, dario_score(w, ctx, ctx_n, prev, step) + randf() * noise};
+    char *tok = strtok(buf, " \t\n\r,.;:!?\"'()[]{}");
+    while (tok && n < max_ids) {
+        if (strlen(tok) < 2 || is_stop(tok)) { tok = strtok(NULL, " \t\n\r,.;:!?\"'()[]{}"); continue; }
+        int idx = find_word(tok);
+        if (idx >= 0) {
+            ids[n++] = idx;
+        } else {
+            /* prefix match */
+            int best = -1, best_len = 0;
+            for (int i = 0; i < NWORDS; i++) {
+                int ml = strlen(VOCAB[i]);
+                int kl = strlen(tok);
+                int mn = ml < kl ? ml : kl;
+                int plen = 0;
+                for (int j = 0; j < mn; j++) {
+                    if (VOCAB[i][j] == tok[j]) plen++;
+                    else break;
+                }
+                if (plen > best_len) { best_len = plen; best = i; }
+            }
+            if (best >= 0 && best_len >= 3) ids[n++] = best;
+        }
+        tok = strtok(NULL, " \t\n\r,.;:!?\"'()[]{}");
     }
-
-    /* sort descending */
-    for (int i = 0; i < n-1; i++)
-        for (int j = i+1; j < n; j++)
-            if (scores[j].score > scores[i].score) { Sc t = scores[i]; scores[i] = scores[j]; scores[j] = t; }
-
-    /* top-k=12 sampling */
-    int k = n < 12 ? n : 12;
-    float sum = 0.001f;
-    for (int i = 0; i < k; i++) sum += scores[i].score > 0 ? scores[i].score : 0;
-    float r = randf() * sum;
-    for (int i = 0; i < k; i++) {
-        r -= scores[i].score > 0 ? scores[i].score : 0;
-        if (r <= 0) return scores[i].idx;
-    }
-    return scores[0].idx;
+    return n;
 }
+
+/* ═══════════════════════════════════════════════════════════════
+ * TRAINING — next-word prediction, step s predicts word[s+1]
+ * ═══════════════════════════════════════════════════════════════ */
+
+static void train(Model *m, const char *data_path, int train_steps, float lr) {
+    FILE *f = fopen(data_path, "r");
+    if (!f) { fprintf(stderr, "  cannot open %s\n", data_path); return; }
+    fseek(f, 0, SEEK_END);
+    long fsz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *text = (char *)malloc(fsz + 1);
+    fread(text, 1, fsz, f);
+    text[fsz] = 0;
+    fclose(f);
+
+    int *ids = (int *)malloc((fsz / 2 + 1) * sizeof(int));
+    int n_ids = tokenize_text(text, ids, fsz / 2);
+    free(text);
+
+    int window = NSTEPS + 1;
+    if (n_ids < window + 1) {
+        fprintf(stderr, "  corpus too small: %d words (need %d+)\n", n_ids, window + 1);
+        free(ids);
+        return;
+    }
+
+    printf("  corpus: %ld bytes -> %d vocab words\n", fsz, n_ids);
+    printf("  model: %d params (%.1fMB f32)\n", total_param_count(), total_param_count() * 4.0f / 1e6);
+    printf("  training: %d steps, lr=%.1e\n", train_steps, lr);
+
+    /* alloc scratch buffers */
+    float *logits  = (float *)malloc(NWORDS * sizeof(float));
+    float *probs   = (float *)malloc(NWORDS * sizeof(float));
+    float *d_logits= (float *)malloc(NWORDS * sizeof(float));
+    float *d_out   = (float *)malloc(DIM * sizeof(float));
+    float *query   = (float *)malloc(DIM * sizeof(float));
+    float *query_n = (float *)malloc(DIM * sizeof(float));
+    float *gate    = (float *)malloc(HDIM * sizeof(float));
+    float *up      = (float *)malloc(HDIM * sizeof(float));
+    float *swiglu  = (float *)malloc(HDIM * sizeof(float));
+    float *hidden  = (float *)malloc(DIM * sizeof(float));
+    float *out     = (float *)malloc(DIM * sizeof(float));
+    float *d_swiglu= (float *)malloc(HDIM * sizeof(float));
+    float *ctx     = (float *)malloc(DIM * sizeof(float));
+
+    float best_loss = 1e9f;
+
+    for (int step = 1; step <= train_steps; step++) {
+        int start = rand() % (n_ids - window);
+        int *win = ids + start;
+
+        float total_loss = 0;
+
+        for (int s = 0; s < NSTEPS; s++) {
+            int ctx_n = s + 1;
+            int target = win[s + 1];
+            StepWeights *sw = &m->steps[s];
+
+            /* forward */
+            forward_step(m, win, ctx_n, s, logits, query, query_n, gate, up, swiglu, hidden, out);
+            softmax_v(logits, probs, NWORDS);
+
+            float p = probs[target];
+            if (p < 1e-10f) p = 1e-10f;
+            total_loss -= logf(p);
+
+            /* d_logits = probs - one_hot(target) */
+            for (int i = 0; i < NWORDS; i++) d_logits[i] = probs[i];
+            d_logits[target] -= 1.0f;
+
+            /* d_out = E @ d_logits (from tied output) */
+            for (int j = 0; j < DIM; j++) {
+                float s_val = 0;
+                for (int v = 0; v < NWORDS; v++)
+                    s_val += d_logits[v] * m->embed[v * DIM + j];
+                d_out[j] = s_val;
+            }
+
+            /* update embedding (SGD on tied weights) */
+            for (int v = 0; v < NWORDS; v++) {
+                if (fabsf(d_logits[v]) < 1e-8f) continue;
+                for (int j = 0; j < DIM; j++)
+                    m->embed[v * DIM + j] -= lr * d_logits[v] * out[j];
+            }
+
+            /* backprop through w_down */
+            matmul_mtv(sw->w_down, d_out, d_swiglu, DIM, HDIM);
+            for (int i = 0; i < HDIM; i++)
+                for (int j = 0; j < DIM; j++)
+                    sw->w_down[i * DIM + j] -= lr * swiglu[i] * d_out[j];
+
+            /* backprop through SwiGLU */
+            for (int i = 0; i < HDIM; i++) {
+                float sg = siluf(gate[i]);
+                float sig = (gate[i] > -20) ? 1.0f / (1.0f + expf(-gate[i])) : 0;
+                float silu_grad = (gate[i] > -20) ? sig * (1.0f + gate[i] * (1.0f - sig)) : 0;
+                float d_gate_i = d_swiglu[i] * up[i] * silu_grad;
+                float d_up_i = d_swiglu[i] * sg;
+
+                for (int j = 0; j < DIM; j++) {
+                    sw->w_gate[i * DIM + j] -= lr * d_gate_i * query_n[j];
+                    sw->w_up[i * DIM + j] -= lr * d_up_i * query_n[j];
+                }
+            }
+
+            /* d_query_n (skip full RMSNorm backward, approximate) */
+            float ss = 0;
+            for (int i = 0; i < DIM; i++) ss += query[i] * query[i];
+            ss = ss / DIM + 1e-5f;
+            float inv = 1.0f / sqrtf(ss);
+            float d_query[DIM];
+            for (int i = 0; i < DIM; i++)
+                d_query[i] = d_out[i] * sw->rms[i] * inv;
+
+            /* update Wr */
+            pool_context(m, win, ctx_n, ctx);
+            for (int i = 0; i < DIM; i++) {
+                if (fabsf(d_query[i]) < 1e-8f) continue;
+                for (int j = 0; j < DIM; j++)
+                    sw->wr[i * DIM + j] -= lr * d_query[i] * ctx[j];
+            }
+        }
+
+        float avg_loss = total_loss / NSTEPS;
+        if (avg_loss < best_loss) best_loss = avg_loss;
+
+        if (step % 50 == 0 || step == 1)
+            printf("  step %5d/%d  loss=%.4f  best=%.4f\n", step, train_steps, avg_loss, best_loss);
+    }
+
+    printf("  training complete. best loss: %.4f\n", best_loss);
+
+    free(ids); free(logits); free(probs); free(d_logits); free(d_out);
+    free(query); free(query_n); free(gate); free(up); free(swiglu);
+    free(hidden); free(out); free(d_swiglu); free(ctx);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * GENERATION — 12 steps, each picks one word
+ * ═══════════════════════════════════════════════════════════════ */
 
 static int find_seed(const char *key) {
     int idx = find_word(key);
@@ -509,7 +824,7 @@ static void extract_key(const char *text, char *out, int maxlen) {
     else { strncpy(out, "silence", maxlen-1); out[maxlen-1]=0; }
 }
 
-static void run_chain(const char *text) {
+static void run_chain(Model *m, const char *text) {
     char key[64];
     extract_key(text, key, sizeof(key));
     int seed = find_seed(key);
@@ -517,7 +832,7 @@ static void run_chain(const char *text) {
     /* prophecy */
     int deep_cats[] = {2, 5, 7};
     int tcat = deep_cats[rand() % 3];
-    int ranges[][2] = {{0,100},{100,200},{200,300},{300,350},{350,450},{450,550},{550,650},{650,1984}};
+    int ranges[][2] = {{0,100},{100,200},{200,300},{300,350},{350,450},{450,550},{550,650},{650,NWORDS}};
     prophecy_target = ranges[tcat][0] + rand() % (ranges[tcat][1] - ranges[tcat][0]);
     if (prophecy_target >= NWORDS) prophecy_target = NWORDS - 1;
     prophecy_age = 0;
@@ -525,50 +840,83 @@ static void run_chain(const char *text) {
     printf("\n  destined: %s\n", VOCAB[prophecy_target]);
     printf("\n  %s\n", VOCAB[seed]);
 
-    int chain[STEPS+1], chain_n = 0;
-    int forbidden[STEPS+100], nforbid = 0;
+    int chain[NSTEPS+1], chain_n = 0;
+    int forbidden[NSTEPS+100], nforbid = 0;
     chain[chain_n++] = seed;
     forbidden[nforbid++] = seed;
 
     int prev = seed;
-    float total_debt = 0;
+
+    /* scratch */
+    float *logits  = (float *)malloc(NWORDS * sizeof(float));
+    float *probs   = (float *)malloc(NWORDS * sizeof(float));
+    float *query   = (float *)malloc(DIM * sizeof(float));
+    float *query_n = (float *)malloc(DIM * sizeof(float));
+    float *gate    = (float *)malloc(HDIM * sizeof(float));
+    float *up      = (float *)malloc(HDIM * sizeof(float));
+    float *swiglu  = (float *)malloc(HDIM * sizeof(float));
+    float *hidden  = (float *)malloc(DIM * sizeof(float));
+    float *out     = (float *)malloc(DIM * sizeof(float));
+
     int fulfilled = 0;
 
-    for (int step = 0; step < STEPS; step++) {
+    for (int step = 0; step < NSTEPS; step++) {
         update_chambers(step);
         prophecy_age++;
 
-        int word = select_word(chain, chain_n, prev, step, forbidden, nforbid);
-        chain[chain_n++] = word;
-        forbidden[nforbid++] = word;
+        /* learned logits */
+        forward_step(m, chain, chain_n, step, logits, query, query_n, gate, up, swiglu, hidden, out);
 
-        cooc_update(prev, word);
-        bigram_update(prev, word);
-        int cat = word_category(word);
+        /* Dario field overlay */
+        dario_overlay(logits, chain, chain_n, step);
+
+        /* mask forbidden */
+        for (int f = 0; f < nforbid; f++)
+            logits[forbidden[f]] = -1e9f;
+
+        /* top-k=12 sampling */
+        softmax_v(logits, probs, NWORDS);
+        typedef struct { int idx; float p; } Sc;
+        Sc top[12];
+        for (int i = 0; i < 12; i++) top[i] = (Sc){0, -1};
+
+        for (int w = 0; w < NWORDS; w++) {
+            for (int k = 0; k < 12; k++) {
+                if (probs[w] > top[k].p) {
+                    for (int j = 11; j > k; j--) top[j] = top[j-1];
+                    top[k] = (Sc){w, probs[w]};
+                    break;
+                }
+            }
+        }
+
+        float total = 0.001f;
+        for (int i = 0; i < 12; i++) total += top[i].p > 0 ? top[i].p : 0;
+        float r = randf() * total;
+        int pick = top[0].idx;
+        for (int i = 0; i < 12; i++) {
+            r -= top[i].p > 0 ? top[i].p : 0;
+            if (r <= 0) { pick = top[i].idx; break; }
+        }
+
+        chain[chain_n++] = pick;
+        forbidden[nforbid++] = pick;
+
+        cooc_update(prev, pick);
+        int cat = word_category(pick);
         destiny[cat] = 0.3f + 0.7f * destiny[cat];
 
-        if (word != prophecy_target)
-            total_debt += 0.1f * logf(1.0f + prophecy_age);
-        else {
-            total_debt = total_debt > 1 ? total_debt - 1 : 0;
-            fulfilled = 1;
-        }
+        if (pick == prophecy_target) fulfilled = 1;
 
         if (step > 7) trauma = trauma + 0.1f < 1 ? trauma + 0.1f : 1;
         trauma *= 0.97f;
 
-        int start = chain_n > 4 ? chain_n - 4 : 0;
-        for (int c = start; c < chain_n; c++)
-            cooc_update(chain[c], word);
-
-        if (step == STEPS - 1)
-            printf("  *%s\n", VOCAB[word]);
+        if (step == NSTEPS - 1)
+            printf("  *%s\n", VOCAB[pick]);
         else
-            printf("   %s\n", VOCAB[word]);
-        prev = word;
+            printf("   %s\n", VOCAB[pick]);
+        prev = pick;
     }
-
-    total_steps += STEPS;
 
     int cats_seen = 0, cat_flags[8] = {0};
     for (int i = 0; i < chain_n; i++) {
@@ -576,9 +924,11 @@ static void run_chain(const char *text) {
         if (!cat_flags[c]) { cat_flags[c] = 1; cats_seen++; }
     }
 
-    printf("\n  debt %.2f \xc2\xb7 resonance %.2f \xc2\xb7 drift %d/8 \xc2\xb7 prophecy %s\n",
-           total_debt, cooc_n / 100.0f, cats_seen,
-           fulfilled ? "fulfilled" : "unfulfilled");
+    printf("\n  drift %d/8 \xc2\xb7 prophecy %s\n",
+           cats_seen, fulfilled ? "fulfilled" : "unfulfilled");
+
+    free(logits); free(probs); free(query); free(query_n);
+    free(gate); free(up); free(swiglu); free(hidden); free(out);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -587,29 +937,64 @@ static void run_chain(const char *text) {
 
 int main(int argc, char **argv) {
     srand(time(NULL));
-    printf("\n  penelope \xe2\x80\x94 1984 words, 12 steps, Dario Equation\n");
+
+    char *train_path = NULL;
+    char *load_path = NULL;
+    char *save_path = NULL;
+    int train_steps = 5000;
+    float lr = 3e-4f;
+    char *text = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--train") == 0 && i+1 < argc) { train_path = argv[++i]; }
+        else if (strcmp(argv[i], "--load") == 0 && i+1 < argc) { load_path = argv[++i]; }
+        else if (strcmp(argv[i], "--save") == 0 && i+1 < argc) { save_path = argv[++i]; }
+        else if (strcmp(argv[i], "--steps") == 0 && i+1 < argc) { train_steps = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "--lr") == 0 && i+1 < argc) { lr = atof(argv[++i]); }
+        else {
+            /* collect remaining as text */
+            static char textbuf[2048];
+            textbuf[0] = 0;
+            for (int j = i; j < argc; j++) {
+                if (j > i) strcat(textbuf, " ");
+                strncat(textbuf, argv[j], sizeof(textbuf) - strlen(textbuf) - 2);
+            }
+            text = textbuf;
+            break;
+        }
+    }
+
+    Model model;
+    model_init(&model);
+
+    printf("\n  penelope \xe2\x80\x94 1984 words, %d steps, Dario Equation\n", NSTEPS);
+    printf("  %d trainable params (%.1fMB f32)\n", total_param_count(),
+           total_param_count() * 4.0f / 1e6);
     printf("  by Arianna Method\n\n");
 
-    if (argc > 1) {
-        char buf[1024] = {0};
-        for (int i = 1; i < argc; i++) {
-            if (i > 1) strcat(buf, " ");
-            strncat(buf, argv[i], sizeof(buf) - strlen(buf) - 2);
+    if (load_path) model_load(&model, load_path);
+    if (train_path) {
+        train(&model, train_path, train_steps, lr);
+        if (save_path) model_save(&model, save_path);
+    }
+
+    if (text) {
+        run_chain(&model, text);
+    } else if (!train_path) {
+        char line[1024];
+        while (1) {
+            printf("  > ");
+            fflush(stdout);
+            if (!fgets(line, sizeof(line), stdin)) break;
+            int len = strlen(line);
+            while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = 0;
+            if (len == 0) continue;
+            run_chain(&model, line);
         }
-        run_chain(buf);
-        return 0;
     }
 
-    char line[1024];
-    while (1) {
-        printf("  > ");
-        fflush(stdout);
-        if (!fgets(line, sizeof(line), stdin)) break;
-        int len = strlen(line);
-        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = 0;
-        if (len == 0) continue;
-        run_chain(line);
-    }
+    if (save_path && !train_path) model_save(&model, save_path);
 
+    model_free(&model);
     return 0;
 }
