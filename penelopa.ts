@@ -403,7 +403,13 @@ class StepWeights {
   }
 
   params(): number[] {
-    return [...this.wr, ...this.rms, ...this.w_gate, ...this.w_up, ...this.w_down];
+    const out: number[] = [];
+    for (let i = 0; i < this.wr.length; i++) out.push(this.wr[i]);
+    for (let i = 0; i < this.rms.length; i++) out.push(this.rms[i]);
+    for (let i = 0; i < this.w_gate.length; i++) out.push(this.w_gate[i]);
+    for (let i = 0; i < this.w_up.length; i++) out.push(this.w_up[i]);
+    for (let i = 0; i < this.w_down.length; i++) out.push(this.w_down[i]);
+    return out;
   }
 
   loadFrom(flat: number[], offset: number): number {
@@ -478,17 +484,23 @@ class Penelope {
   }
 
   save(path: string): void {
-    const flat: number[] = [...this.embed];
-    for (const s of this.steps) flat.push(...s.params());
-
+    const totalParams = this.paramCount();
     const headerBuf = Buffer.alloc(16);
     headerBuf.writeInt32LE(V, 0);
     headerBuf.writeInt32LE(D, 4);
     headerBuf.writeInt32LE(M, 8);
     headerBuf.writeInt32LE(STEPS, 12);
 
-    const bodyBuf = Buffer.alloc(flat.length * 4);
-    for (let i = 0; i < flat.length; i++) bodyBuf.writeFloatLE(flat[i], i * 4);
+    const bodyBuf = Buffer.alloc(totalParams * 4);
+    let off = 0;
+    for (let i = 0; i < this.embed.length; i++) { bodyBuf.writeFloatLE(this.embed[i], off); off += 4; }
+    for (const s of this.steps) {
+      for (let i = 0; i < s.wr.length; i++) { bodyBuf.writeFloatLE(s.wr[i], off); off += 4; }
+      for (let i = 0; i < s.rms.length; i++) { bodyBuf.writeFloatLE(s.rms[i], off); off += 4; }
+      for (let i = 0; i < s.w_gate.length; i++) { bodyBuf.writeFloatLE(s.w_gate[i], off); off += 4; }
+      for (let i = 0; i < s.w_up.length; i++) { bodyBuf.writeFloatLE(s.w_up[i], off); off += 4; }
+      for (let i = 0; i < s.w_down.length; i++) { bodyBuf.writeFloatLE(s.w_down[i], off); off += 4; }
+    }
 
     const fd = fs.openSync(path, "w");
     fs.writeSync(fd, headerBuf);
@@ -496,7 +508,7 @@ class Penelope {
     fs.closeSync(fd);
 
     const size = fs.statSync(path).size;
-    console.log(`  saved ${path}: ${flat.length} params (${(size / 1e6).toFixed(1)}MB)`);
+    console.log(`  saved ${path}: ${totalParams} params (${(size / 1e6).toFixed(1)}MB)`);
   }
 
   load(path: string): void {
