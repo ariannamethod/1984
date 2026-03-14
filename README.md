@@ -45,6 +45,14 @@ Where B is bigram affinity, H is Hebbian co-occurrence, F is prophecy fulfillmen
 
 All examples below are from the JavaScript version running in a browser. Weightless mode — no training. The dual tokenizer at work.
 
+**"love"** — destined: entropy — unfulfilled
+
+<p align="center">
+  <img src="demo_love.png" width="520" />
+</p>
+
+> love → create → push → remember → hide → delay → vibration → gravity → comfort → basalt → shapeshifter → scatter → **abandon**
+
 **"hello"** — destined: story — unfulfilled
 
 <p align="center">
