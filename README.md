@@ -10,7 +10,7 @@ Janus Architecture.
   <img src="penelope.jpg" width="320" />
 </p>
 
-Not a transformer. Not trying to be.
+Not a transformer. Not pretenting to be.
 
 Penelope represents a shift toward post-probabilistic, post-symbolic AI. She doesn't predict the next token from a statistical distribution over a corpus. She resonates. A fixed vocabulary of exactly 1984 words — body, nature, emotion, time, society, abstraction, action, ritual, geometry, myth — becomes a closed universe of meaning. Every output is a real word. Gibberish is architecturally impossible.
 
