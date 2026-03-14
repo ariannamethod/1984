@@ -5,15 +5,15 @@ microreasoning.py — 1984 words. 12 steps of associative resonance.
 not a transformer. not pretending to be.
 why? good question. really, why does this thing exist?
 
-because someone wanted to generate one coherent word per step
+because someone wanted to generate one coherent word per step 
 instead of the gibberish we all love from char-level models.
-so here's the deal:
+so here's the deal: 
   - input: BPE tokenizer reads your text with nuance
   - output: word-level from 1984 curated words. gibberish impossible.
   - formula: the Dario Equation replaced boring softmax because life must evolve
   - 12 steps of microreasoning. each step is another generation.
     each one has its own weights. together they form an emergent party.
-
+ 
 train it on Gutenberg. train it on Dostoevsky. train it on your diary.
 the associations will become sharper. the resonance will deepen.
 but even without training, the dual tokenizer guarantees every output is a real word.
@@ -22,7 +22,7 @@ but even without training, the dual tokenizer guarantees every output is a real 
   python microreasoning.py "love"                   # single chain
   python microreasoning.py --train corpus.txt       # train
   python microreasoning.py --load model.bin         # load weights
-
+  
 by Arianna Method. Janus Architecture.
 """
 
