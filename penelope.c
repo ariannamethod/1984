@@ -3,7 +3,7 @@
  *
  * Trainable resonance engine. Not a transformer. A mirror that learns.
  *
- * Input:  text → vocab word IDs (prefix matching)
+ * Input:  text → vocab word IDs (BPE: exact + stem + greedy vocab decomposition)
  * Attend: RRPRAM resonance + SwiGLU per step (how it thinks)
  * Output: word-level from 1984 vocab (gibberish impossible)
  *
@@ -307,6 +307,79 @@ static int find_word(const char *w) {
     for (int i = 0; i < NWORDS; i++)
         if (strcmp(VOCAB[i], w) == 0) return i;
     return -1;
+}
+
+/* precomputed vocab word lengths for greedy match */
+static int vocab_len[NWORDS];
+static void init_vocab_lens(void) {
+    for (int i = 0; i < NWORDS; i++)
+        vocab_len[i] = (int)strlen(VOCAB[i]);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * BPE INPUT — stem + greedy longest vocab match
+ *
+ * Three-stage tokenizer for arbitrary text:
+ *   1. Exact vocab match     ("fire" → fire)
+ *   2. Suffix stripping       ("burning" → burn, "created" → create)
+ *   3. Greedy decomposition   ("heartbreak" → heart + break)
+ *
+ * The 1984 vocab words ARE the BPE token vocabulary.
+ * Greedy longest-match IS BPE encoding.
+ * ═══════════════════════════════════════════════════════════════ */
+
+static const char *SUFFIXES[] = {
+    "ting","ning","ring","ling","ding","ping","bing","ging","ming","king",
+    "sing","zing",
+    "ing","ment","ness","tion","sion","able","ible","ence","ance",
+    "eous","ious","ful","less","ize","ise","ous","ive","ity",
+    "ly","er","ed","est","al","en","es","s", NULL
+};
+
+static int try_stem(const char *word) {
+    char stem[64];
+    int wlen = (int)strlen(word);
+    for (int i = 0; SUFFIXES[i]; i++) {
+        int slen = (int)strlen(SUFFIXES[i]);
+        if (wlen <= slen + 2) continue;
+        if (strcmp(word + wlen - slen, SUFFIXES[i]) != 0) continue;
+        int sl = wlen - slen;
+        strncpy(stem, word, sl); stem[sl] = '\0';
+        int idx = find_word(stem);
+        if (idx >= 0) return idx;
+        /* stem + 'e' (creat→create, danc→dance) */
+        stem[sl] = 'e'; stem[sl+1] = '\0';
+        idx = find_word(stem);
+        if (idx >= 0) return idx;
+        /* doubled consonant (runn→run, swimm→swim) */
+        if (sl >= 3 && stem[sl-1] == stem[sl-2]) {
+            stem[sl-1] = '\0';
+            idx = find_word(stem);
+            if (idx >= 0) return idx;
+        }
+    }
+    return -1;
+}
+
+static int greedy_vocab_match(const char *word, int wlen, int *ids, int max_ids) {
+    int n = 0, pos = 0;
+    while (pos < wlen && n < max_ids) {
+        int best = -1, best_len = 0;
+        for (int v = 0; v < NWORDS; v++) {
+            int vl = vocab_len[v];
+            if (vl <= best_len || vl > wlen - pos) continue;
+            if (strncmp(word + pos, VOCAB[v], vl) == 0) {
+                best = v; best_len = vl;
+            }
+        }
+        if (best >= 0 && best_len >= 3) {
+            ids[n++] = best;
+            pos += best_len;
+        } else {
+            pos++;
+        }
+    }
+    return n;
 }
 
 static int word_category(int idx) {
@@ -661,37 +734,42 @@ static void dario_overlay(float *logits, int *ctx, int ctx_n, int step) {
  * ═══════════════════════════════════════════════════════════════ */
 
 static int tokenize_text(const char *text, int *ids, int max_ids) {
-    char buf[4096];
-    int bi = 0;
-    for (int i = 0; text[i] && bi < 4094; i++)
-        buf[bi++] = tolower(text[i]);
-    buf[bi] = 0;
+    int len = (int)strlen(text);
+    char *buf = (char *)malloc(len + 1);
+    if (!buf) return 0;
+    for (int i = 0; i <= len; i++) buf[i] = tolower(text[i]);
 
-    int n = 0;
-    char *tok = strtok(buf, " \t\n\r,.;:!?\"'()[]{}");
-    while (tok && n < max_ids) {
-        if (strlen(tok) < 2 || is_stop(tok)) { tok = strtok(NULL, " \t\n\r,.;:!?\"'()[]{}"); continue; }
-        int idx = find_word(tok);
-        if (idx >= 0) {
-            ids[n++] = idx;
-        } else {
-            /* prefix match */
-            int best = -1, best_len = 0;
-            for (int i = 0; i < NWORDS; i++) {
-                int ml = strlen(VOCAB[i]);
-                int kl = strlen(tok);
-                int mn = ml < kl ? ml : kl;
-                int plen = 0;
-                for (int j = 0; j < mn; j++) {
-                    if (VOCAB[i][j] == tok[j]) plen++;
-                    else break;
-                }
-                if (plen > best_len) { best_len = plen; best = i; }
-            }
-            if (best >= 0 && best_len >= 3) ids[n++] = best;
+    int n = 0, pos = 0;
+    while (pos < len && n < max_ids) {
+        while (pos < len && !isalpha(buf[pos])) pos++;
+        if (pos >= len) break;
+
+        char word[64];
+        int wl = 0;
+        while (pos < len && isalpha(buf[pos]) && wl < 63)
+            word[wl++] = buf[pos++];
+        word[wl] = '\0';
+
+        if (wl < 2 || is_stop(word)) continue;
+
+        /* 1. exact vocab match */
+        int idx = find_word(word);
+        if (idx >= 0) { ids[n++] = idx; continue; }
+
+        /* 2. stem + match */
+        idx = try_stem(word);
+        if (idx >= 0) { ids[n++] = idx; continue; }
+
+        /* 3. greedy longest vocab match (BPE decomposition) */
+        int sub[8];
+        int ns = greedy_vocab_match(word, wl, sub, 8);
+        for (int i = 0; i < ns && n < max_ids; i++) {
+            if (n == 0 || ids[n-1] != sub[i])
+                ids[n++] = sub[i];
         }
-        tok = strtok(NULL, " \t\n\r,.;:!?\"'()[]{}");
     }
+
+    free(buf);
     return n;
 }
 
@@ -1030,6 +1108,7 @@ static void run_chain(Model *m, const char *text) {
 
 int main(int argc, char **argv) {
     srand(time(NULL));
+    init_vocab_lens();
 
     char *train_path = NULL;
     char *load_path = NULL;
