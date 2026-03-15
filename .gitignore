@@ -10,3 +10,6 @@ test/test_penelope_aml
 *.o
 *.bin
 penelope_rs
+__pycache__/
+node_modules/
+package*.json

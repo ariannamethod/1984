@@ -14,14 +14,14 @@
 # Together they form the resonance engine.
 #
 # Architecture per step s:
-#     context = pool(embed(words))
+#     context = pool(embed_in(BPE tokens))
 #     query   = RMSNorm(context @ Wr_s)          RRPRAM resonance
 #     hidden  = SwiGLU(query; gate_s, up_s, down_s)
-#     logits  = (query + hidden) @ E^T            tied output
+#     logits  = (query + hidden) @ E_out^T        separate output embed
 #     logits += DarioField(context)               live overlay
 #     word    = sample(softmax(logits))
 #
-# Total: ~13M params (762K embed + 12 × 1.03M steps)
+# Total: ~14M params (786K embed_in + 762K embed_out + 12 × 1.03M steps)
 # ═══════════════════════════════════════════════════════════════
 
 
@@ -54,6 +54,72 @@ BLOOD COMPILE penelope_constants {
 #define MAX_COOC 32768
 #define MAX_BIG  16384
 #define MAX_CTX  64
+
+#define BPE_VOCAB   2048
+#define BPE_MERGES  1792
+}
+
+
+# ─────────────────────────────────────────────────────────────
+# BPE TABLE — 1792 merges learned from English text
+# Byte-pair encoding: the real tokenizer. Not greedy vocab match.
+# This is the same table as penelope.c and bpe_merges.h.
+# ─────────────────────────────────────────────────────────────
+
+BLOOD COMPILE penelope_bpe_table {
+#include "tools/bpe_merges.h"
+}
+
+
+# ─────────────────────────────────────────────────────────────
+# BPE ENCODER — text to subword token IDs
+# ─────────────────────────────────────────────────────────────
+
+BLOOD COMPILE penelope_bpe_encoder {
+#define MAX_BPE_SEQ 8192
+
+static int bpe_encode(const char *text, int *ids, int max_ids) {
+    /* 1. Convert text to lowercase bytes -> initial token sequence */
+    int seq[MAX_BPE_SEQ];
+    int len = 0;
+    for (int i = 0; text[i] && len < MAX_BPE_SEQ - 1; i++) {
+        unsigned char c = (unsigned char)text[i];
+        if (c >= 'A' && c <= 'Z') c = c - 'A' + 'a';
+        seq[len++] = c;
+    }
+
+    /* 2. Apply merges in priority order */
+    for (int m = 0; m < BPE_MERGES; m++) {
+        int left = BPE_TABLE[m][0];
+        int right = BPE_TABLE[m][1];
+        int new_id = 256 + m;
+
+        int j = 0;
+        for (int i = 0; i < len; i++) {
+            if (i < len - 1 && seq[i] == left && seq[i+1] == right) {
+                seq[j++] = new_id;
+                i++;  /* skip next */
+            } else {
+                seq[j++] = seq[i];
+            }
+        }
+        len = j;
+    }
+
+    /* 3. Copy to output */
+    int n = len < max_ids ? len : max_ids;
+    memcpy(ids, seq, n * sizeof(int));
+    return n;
+}
+
+/* Precomputed BPE encoding of each vocab word (for generation) */
+static int vocab_bpe[NWORDS][16];
+static int vocab_bpe_len[NWORDS];
+
+static void init_vocab_bpe(void) {
+    for (int i = 0; i < NWORDS; i++)
+        vocab_bpe_len[i] = bpe_encode(VOCAB[i], vocab_bpe[i], 16);
+}
 }
 
 
@@ -301,7 +367,7 @@ static const char *VOCAB[NWORDS] = {
 "margin","periphery","frontier","borderland","hinterland","interior","core","nucleus","membrane","skin",
 "permission","prohibition","transgression","taboo","norm","deviation","exception","precedent","custom","habit",
 "witness","testimony","evidence","proof","alibi","verdict","appeal","clemency","execution","reprieve",
-"debt","credit","interest","principal","collateral","default","bankruptcy","solvency","dividend","investment",
+"debt","credit","interest","principal",
 };
 }
 
@@ -389,7 +455,7 @@ static float siluf(float x) {
 
 BLOOD COMPILE penelope_model {
 /* ═══════════════════════════════════════════════════════════════
- * TRAINABLE MODEL — 12 step-specific weight sets + shared embed
+ * TRAINABLE MODEL — 12 step-specific weight sets + split embeddings
  * ═══════════════════════════════════════════════════════════════ */
 
 typedef struct {
@@ -414,8 +480,10 @@ typedef struct {
 #define ADAM_EPS 1e-8f
 
 typedef struct {
-    float *embed;   /* [NWORDS * DIM] shared embedding */
-    float *embed_m, *embed_v;  /* Adam moments for embed */
+    float *embed_in;    /* [BPE_VOCAB * DIM]  input BPE embedding */
+    float *embed_out;   /* [NWORDS * DIM]     output word embedding */
+    float *embed_in_m, *embed_in_v;   /* Adam for input embed */
+    float *embed_out_m, *embed_out_v; /* Adam for output embed */
     StepWeights steps[NSTEPS];
     StepAdam    adam[NSTEPS];  /* Adam moments per step */
     int adam_t;               /* Adam timestep counter */
@@ -426,21 +494,29 @@ static int step_param_count(void) {
 }
 
 static int total_param_count(void) {
-    return NWORDS * DIM + NSTEPS * step_param_count();
+    return BPE_VOCAB * DIM + NWORDS * DIM + NSTEPS * step_param_count();
 }
 
 static void model_init(Model *m) {
-    int embed_sz = NWORDS * DIM;
+    int ein_sz = BPE_VOCAB * DIM;
+    int eout_sz = NWORDS * DIM;
     float scale_d = sqrtf(2.0f / DIM);
+    float scale_bpe = sqrtf(2.0f / BPE_VOCAB);
     float scale_v = sqrtf(2.0f / NWORDS);
     float scale_m = sqrtf(2.0f / HDIM);
 
-    m->embed   = (float *)malloc(embed_sz * sizeof(float));
-    m->embed_m = (float *)calloc(embed_sz, sizeof(float));
-    m->embed_v = (float *)calloc(embed_sz, sizeof(float));
-    m->adam_t  = 0;
-    for (int i = 0; i < embed_sz; i++)
-        m->embed[i] = randn() * scale_v;
+    m->embed_in    = (float *)malloc(ein_sz * sizeof(float));
+    m->embed_in_m  = (float *)calloc(ein_sz, sizeof(float));
+    m->embed_in_v  = (float *)calloc(ein_sz, sizeof(float));
+    m->embed_out   = (float *)malloc(eout_sz * sizeof(float));
+    m->embed_out_m = (float *)calloc(eout_sz, sizeof(float));
+    m->embed_out_v = (float *)calloc(eout_sz, sizeof(float));
+    m->adam_t      = 0;
+
+    for (int i = 0; i < ein_sz; i++)
+        m->embed_in[i] = randn() * scale_bpe;
+    for (int i = 0; i < eout_sz; i++)
+        m->embed_out[i] = randn() * scale_v;
 
     for (int s = 0; s < NSTEPS; s++) {
         StepWeights *sw = &m->steps[s];
@@ -472,7 +548,8 @@ static void model_init(Model *m) {
 }
 
 static void model_free(Model *m) {
-    free(m->embed); free(m->embed_m); free(m->embed_v);
+    free(m->embed_in); free(m->embed_in_m); free(m->embed_in_v);
+    free(m->embed_out); free(m->embed_out_m); free(m->embed_out_v);
     for (int s = 0; s < NSTEPS; s++) {
         free(m->steps[s].wr); free(m->steps[s].rms);
         free(m->steps[s].w_gate); free(m->steps[s].w_up); free(m->steps[s].w_down);
@@ -504,9 +581,10 @@ static void adam_update(float *w, float *am, float *av, float *grad,
 static void model_save(Model *m, const char *path) {
     FILE *f = fopen(path, "wb");
     if (!f) { fprintf(stderr, "  cannot open %s for writing\n", path); return; }
-    int header[4] = { NWORDS, DIM, HDIM, NSTEPS };
-    fwrite(header, sizeof(int), 4, f);
-    fwrite(m->embed, sizeof(float), NWORDS * DIM, f);
+    int header[6] = { 0x50454E32, BPE_VOCAB, NWORDS, DIM, HDIM, NSTEPS };
+    fwrite(header, sizeof(int), 6, f);
+    fwrite(m->embed_in, sizeof(float), BPE_VOCAB * DIM, f);
+    fwrite(m->embed_out, sizeof(float), NWORDS * DIM, f);
     for (int s = 0; s < NSTEPS; s++) {
         StepWeights *sw = &m->steps[s];
         fwrite(sw->wr, sizeof(float), DIM*DIM, f);
@@ -521,7 +599,7 @@ static void model_save(Model *m, const char *path) {
     fseek(check, 0, SEEK_END);
     long sz = ftell(check);
     fclose(check);
-    int expected = 16 + total_param_count() * 4;
+    int expected = 24 + total_param_count() * 4;
     printf("  saved %s: %d params (%.1fMB) [%s]\n", path, total_param_count(),
            sz / 1e6, sz == expected ? "OK" : "SIZE MISMATCH!");
 }
@@ -529,15 +607,49 @@ static void model_save(Model *m, const char *path) {
 static int model_load(Model *m, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "  cannot open %s\n", path); return 0; }
-    int header[4];
-    fread(header, sizeof(int), 4, f);
-    if (header[0] != NWORDS || header[1] != DIM || header[2] != HDIM || header[3] != NSTEPS) {
-        fprintf(stderr, "  config mismatch: V=%d D=%d M=%d S=%d\n",
-                header[0], header[1], header[2], header[3]);
+    int magic;
+    fread(&magic, sizeof(int), 1, f);
+
+    if (magic == 0x50454E32) {
+        /* v2 format */
+        int hdr[5];
+        fread(hdr, sizeof(int), 5, f);
+        if (hdr[0] != BPE_VOCAB || hdr[1] != NWORDS || hdr[2] != DIM ||
+            hdr[3] != HDIM || hdr[4] != NSTEPS) {
+            fprintf(stderr, "  v2 config mismatch: BV=%d V=%d D=%d M=%d S=%d\n",
+                    hdr[0], hdr[1], hdr[2], hdr[3], hdr[4]);
+            fclose(f);
+            return 0;
+        }
+        fread(m->embed_in, sizeof(float), BPE_VOCAB * DIM, f);
+        fread(m->embed_out, sizeof(float), NWORDS * DIM, f);
+        for (int s = 0; s < NSTEPS; s++) {
+            StepWeights *sw = &m->steps[s];
+            fread(sw->wr, sizeof(float), DIM*DIM, f);
+            fread(sw->rms, sizeof(float), DIM, f);
+            fread(sw->w_gate, sizeof(float), DIM*HDIM, f);
+            fread(sw->w_up, sizeof(float), DIM*HDIM, f);
+            fread(sw->w_down, sizeof(float), HDIM*DIM, f);
+        }
+        fclose(f);
+        printf("  loaded v2 %s: %d params\n", path, total_param_count());
+        return 1;
+    }
+
+    /* v1 format: magic was actually header[0]=NWORDS */
+    int header[3];
+    fread(header, sizeof(int), 3, f);
+    if (magic != NWORDS || header[0] != DIM || header[1] != HDIM || header[2] != NSTEPS) {
+        fprintf(stderr, "  v1 config mismatch: V=%d D=%d M=%d S=%d\n",
+                magic, header[0], header[1], header[2]);
         fclose(f);
         return 0;
     }
-    fread(m->embed, sizeof(float), NWORDS * DIM, f);
+    /* read old embed -> embed_out, init embed_in randomly */
+    fread(m->embed_out, sizeof(float), NWORDS * DIM, f);
+    float scale_bpe = sqrtf(2.0f / BPE_VOCAB);
+    for (int i = 0; i < BPE_VOCAB * DIM; i++)
+        m->embed_in[i] = randn() * scale_bpe;
     for (int s = 0; s < NSTEPS; s++) {
         StepWeights *sw = &m->steps[s];
         fread(sw->wr, sizeof(float), DIM*DIM, f);
@@ -547,7 +659,8 @@ static int model_load(Model *m, const char *path) {
         fread(sw->w_down, sizeof(float), HDIM*DIM, f);
     }
     fclose(f);
-    printf("  loaded %s: %d params\n", path, total_param_count());
+    printf("  WARNING: migrated v1 weights -> v2 (embed_in initialized randomly)\n");
+    printf("  loaded v1 %s: %d params (embed_out from v1, embed_in new)\n", path, total_param_count());
     return 1;
 }
 }
@@ -565,11 +678,11 @@ BLOOD COMPILE penelope_forward {
  * FORWARD — one step produces logits[NWORDS]
  * ═══════════════════════════════════════════════════════════════ */
 
-static void pool_context(Model *m, int *ids, int n, float *ctx) {
-    for (int j = 0; j < DIM; j++) ctx[j] = 0;
+static void pool_context(Model *m, int *bpe_ids, int n, float *ctx) {
+    memset(ctx, 0, DIM * sizeof(float));
     for (int i = 0; i < n; i++)
         for (int j = 0; j < DIM; j++)
-            ctx[j] += m->embed[ids[i] * DIM + j];
+            ctx[j] += m->embed_in[bpe_ids[i] * DIM + j];
     float inv = 1.0f / (n > 0 ? n : 1);
     for (int j = 0; j < DIM; j++) ctx[j] *= inv;
 }
@@ -621,8 +734,8 @@ static void forward_step(Model *m, int *ctx_ids, int ctx_n, int step_idx,
     /* Residual */
     for (int i = 0; i < DIM; i++)
         out[i] = query_n[i] + hidden[i];
-    /* Logits = E @ out (tied weights): logits[v] = sum_j E[v,j]*out[j] */
-    matmul_mv(m->embed, out, logits, NWORDS, DIM);
+    /* Logits = E_out @ out (separate output embed) */
+    matmul_mv(m->embed_out, out, logits, NWORDS, DIM);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -744,76 +857,21 @@ static void dario_overlay(float *logits, int *ctx, int ctx_n, int step) {
 
 BLOOD COMPILE penelope_bpe {
 /* ═══════════════════════════════════════════════════════════════
- * BPE INPUT — stem + greedy longest vocab match
+ * BPE INPUT — real byte-pair encoding via BPE_TABLE
  *
- * Three-stage tokenizer for arbitrary text:
- *   1. Exact vocab match     ("fire" → fire)
- *   2. Suffix stripping       ("burning" → burn, "created" → create)
- *   3. Greedy decomposition   ("heartbreak" → heart + break)
+ * Input tokenization now uses proper BPE (2048-token vocabulary).
+ * Old greedy vocab match replaced by bpe_encode() from
+ * penelope_bpe_encoder block.
  *
- * The 1984 vocab words ARE the BPE token vocabulary.
- * Greedy longest-match IS BPE encoding.
+ * For training: text -> bpe_encode -> BPE token IDs -> embed_in
+ * For generation: each vocab word pre-encoded via init_vocab_bpe()
  * ═══════════════════════════════════════════════════════════════ */
 
-/* precomputed vocab word lengths for greedy match */
+/* precomputed vocab word lengths (still used by find_word etc) */
 static int vocab_len[NWORDS];
 static void init_vocab_lens(void) {
     for (int i = 0; i < NWORDS; i++)
         vocab_len[i] = (int)strlen(VOCAB[i]);
-}
-
-static const char *SUFFIXES[] = {
-    "ting","ning","ring","ling","ding","ping","bing","ging","ming","king",
-    "sing","zing",
-    "ing","ment","ness","tion","sion","able","ible","ence","ance",
-    "eous","ious","ful","less","ize","ise","ous","ive","ity",
-    "ly","er","ed","est","al","en","es","s", NULL
-};
-
-static int try_stem(const char *word) {
-    char stem[64];
-    int wlen = (int)strlen(word);
-    for (int i = 0; SUFFIXES[i]; i++) {
-        int slen = (int)strlen(SUFFIXES[i]);
-        if (wlen <= slen + 2) continue;
-        if (strcmp(word + wlen - slen, SUFFIXES[i]) != 0) continue;
-        int sl = wlen - slen;
-        strncpy(stem, word, sl); stem[sl] = '\0';
-        int idx = find_word(stem);
-        if (idx >= 0) return idx;
-        /* stem + 'e' (creat→create, danc→dance) */
-        stem[sl] = 'e'; stem[sl+1] = '\0';
-        idx = find_word(stem);
-        if (idx >= 0) return idx;
-        /* doubled consonant (runn→run, swimm→swim) */
-        if (sl >= 3 && stem[sl-1] == stem[sl-2]) {
-            stem[sl-1] = '\0';
-            idx = find_word(stem);
-            if (idx >= 0) return idx;
-        }
-    }
-    return -1;
-}
-
-static int greedy_vocab_match(const char *word, int wlen, int *ids, int max_ids) {
-    int n = 0, pos = 0;
-    while (pos < wlen && n < max_ids) {
-        int best = -1, best_len = 0;
-        for (int v = 0; v < NWORDS; v++) {
-            int vl = vocab_len[v];
-            if (vl <= best_len || vl > wlen - pos) continue;
-            if (strncmp(word + pos, VOCAB[v], vl) == 0) {
-                best = v; best_len = vl;
-            }
-        }
-        if (best >= 0 && best_len >= 3) {
-            ids[n++] = best;
-            pos += best_len;
-        } else {
-            pos++;
-        }
-    }
-    return n;
 }
 }
 
@@ -825,14 +883,31 @@ static int greedy_vocab_match(const char *word, int wlen, int *ids, int max_ids)
 
 BLOOD COMPILE penelope_tokenizer {
 /* ═══════════════════════════════════════════════════════════════
- * TOKENIZE — extract vocab word IDs from text
+ * TOKENIZE — BPE encoding for training input
+ *
+ * For training: text -> bpe_encode -> BPE token IDs
+ * These are BPE subword tokens (0..2047), NOT vocab word IDs.
+ * The model maps BPE tokens through embed_in, vocab words through embed_out.
+ *
+ * For generation context: vocab words are pre-encoded to BPE via
+ * vocab_bpe[] (initialized by init_vocab_bpe).
  * ═══════════════════════════════════════════════════════════════ */
 
-static int tokenize_text(const char *text, int *ids, int max_ids) {
+static int tokenize_text_to_words(const char *text, int *ids, int max_ids) {
+    /* Tokenize text to vocab word IDs (for training targets).
+     * Uses exact match + stem + greedy vocab decomposition. */
     int len = (int)strlen(text);
     char *buf = (char *)malloc(len + 1);
     if (!buf) return 0;
     for (int i = 0; i <= len; i++) buf[i] = tolower(text[i]);
+
+    static const char *SUFFIXES[] = {
+        "ting","ning","ring","ling","ding","ping","bing","ging","ming","king",
+        "sing","zing",
+        "ing","ment","ness","tion","sion","able","ible","ence","ance",
+        "eous","ious","ful","less","ize","ise","ous","ive","ity",
+        "ly","er","ed","est","al","en","es","s", NULL
+    };
 
     int n = 0, pos = 0;
     while (pos < len && n < max_ids) {
@@ -852,15 +927,49 @@ static int tokenize_text(const char *text, int *ids, int max_ids) {
         if (idx >= 0) { ids[n++] = idx; continue; }
 
         /* 2. stem + match */
-        idx = try_stem(word);
-        if (idx >= 0) { ids[n++] = idx; continue; }
+        {
+            int found = -1;
+            for (int si = 0; SUFFIXES[si]; si++) {
+                int slen = (int)strlen(SUFFIXES[si]);
+                if (wl <= slen + 2) continue;
+                if (strcmp(word + wl - slen, SUFFIXES[si]) != 0) continue;
+                int sl = wl - slen;
+                char stem[64];
+                strncpy(stem, word, sl); stem[sl] = '\0';
+                found = find_word(stem);
+                if (found >= 0) break;
+                stem[sl] = 'e'; stem[sl+1] = '\0';
+                found = find_word(stem);
+                if (found >= 0) break;
+                if (sl >= 3 && stem[sl-1] == stem[sl-2]) {
+                    stem[sl-1] = '\0';
+                    found = find_word(stem);
+                    if (found >= 0) break;
+                }
+            }
+            if (found >= 0) { ids[n++] = found; continue; }
+        }
 
-        /* 3. greedy longest vocab match (BPE decomposition) */
-        int sub[8];
-        int ns = greedy_vocab_match(word, wl, sub, 8);
-        for (int i = 0; i < ns && n < max_ids; i++) {
-            if (n == 0 || ids[n-1] != sub[i])
-                ids[n++] = sub[i];
+        /* 3. greedy longest vocab match */
+        {
+            int gpos = 0;
+            while (gpos < wl && n < max_ids) {
+                int best = -1, best_len = 0;
+                for (int v = 0; v < NWORDS; v++) {
+                    int vl = vocab_len[v];
+                    if (vl <= best_len || vl > wl - gpos) continue;
+                    if (strncmp(word + gpos, VOCAB[v], vl) == 0) {
+                        best = v; best_len = vl;
+                    }
+                }
+                if (best >= 0 && best_len >= 3) {
+                    if (n == 0 || ids[n-1] != best)
+                        ids[n++] = best;
+                    gpos += best_len;
+                } else {
+                    gpos++;
+                }
+            }
         }
     }
 
@@ -880,7 +989,118 @@ static int tokenize_text(const char *text, int *ids, int max_ids) {
 BLOOD COMPILE penelope_training {
 /* ═══════════════════════════════════════════════════════════════
  * TRAINING — next-word prediction, step s predicts word[s+1]
+ *
+ * Dual tokenization: BPE for input context, 1984-vocab for targets.
  * ═══════════════════════════════════════════════════════════════ */
+
+/* Tokenize for training: produces both vocab IDs and BPE sequences per word */
+typedef struct {
+    int *word_ids;      /* 1984-vocab ID per word (for targets) */
+    int *bpe_flat;      /* all BPE tokens concatenated */
+    int *bpe_offset;    /* start index in bpe_flat for each word */
+    int *bpe_len;       /* number of BPE tokens per word */
+    int n_words;        /* total words */
+} TrainTokens;
+
+static TrainTokens tokenize_for_training(const char *text) {
+    TrainTokens t = {0};
+    int len = (int)strlen(text);
+    char *buf = (char *)malloc(len + 1);
+    if (!buf) return t;
+    for (int i = 0; i <= len; i++) buf[i] = tolower(text[i]);
+
+    int max_words = len / 2 + 1;
+    t.word_ids   = (int *)malloc(max_words * sizeof(int));
+    t.bpe_offset = (int *)malloc(max_words * sizeof(int));
+    t.bpe_len    = (int *)malloc(max_words * sizeof(int));
+    t.bpe_flat   = (int *)malloc(len * sizeof(int));
+
+    static const char *SUFFIXES[] = {
+        "ting","ning","ring","ling","ding","ping","bing","ging","ming","king",
+        "sing","zing",
+        "ing","ment","ness","tion","sion","able","ible","ence","ance",
+        "eous","ious","ful","less","ize","ise","ous","ive","ity",
+        "ly","er","ed","est","al","en","es","s", NULL
+    };
+
+    int bpe_pos = 0;
+    int pos = 0;
+    while (pos < len) {
+        while (pos < len && !isalpha(buf[pos])) pos++;
+        if (pos >= len) break;
+
+        char word[64];
+        int wl = 0;
+        while (pos < len && isalpha(buf[pos]) && wl < 63)
+            word[wl++] = buf[pos++];
+        word[wl] = '\0';
+
+        if (wl < 2 || is_stop(word)) continue;
+
+        /* get vocab ID */
+        int vid = find_word(word);
+        if (vid < 0) {
+            /* try stemming */
+            for (int si = 0; SUFFIXES[si]; si++) {
+                int slen = (int)strlen(SUFFIXES[si]);
+                if (wl <= slen + 2) continue;
+                if (strcmp(word + wl - slen, SUFFIXES[si]) != 0) continue;
+                int sl = wl - slen;
+                char stem[64];
+                strncpy(stem, word, sl); stem[sl] = '\0';
+                vid = find_word(stem);
+                if (vid >= 0) break;
+                stem[sl] = 'e'; stem[sl+1] = '\0';
+                vid = find_word(stem);
+                if (vid >= 0) break;
+                if (sl >= 3 && stem[sl-1] == stem[sl-2]) {
+                    stem[sl-1] = '\0';
+                    vid = find_word(stem);
+                    if (vid >= 0) break;
+                }
+            }
+        }
+        if (vid < 0) {
+            /* greedy longest vocab match -- take first match */
+            int gpos = 0;
+            while (gpos < wl) {
+                int best = -1, best_len = 0;
+                for (int v = 0; v < NWORDS; v++) {
+                    int vl = vocab_len[v];
+                    if (vl <= best_len || vl > wl - gpos) continue;
+                    if (strncmp(word + gpos, VOCAB[v], vl) == 0) {
+                        best = v; best_len = vl;
+                    }
+                }
+                if (best >= 0 && best_len >= 3) { vid = best; break; }
+                gpos++;
+            }
+        }
+        if (vid < 0) continue;
+
+        /* get BPE encoding of the word text */
+        int bpe_ids[64];
+        int bpe_n = bpe_encode(word, bpe_ids, 64);
+
+        int w = t.n_words;
+        t.word_ids[w] = vid;
+        t.bpe_offset[w] = bpe_pos;
+        t.bpe_len[w] = bpe_n;
+        memcpy(t.bpe_flat + bpe_pos, bpe_ids, bpe_n * sizeof(int));
+        bpe_pos += bpe_n;
+        t.n_words++;
+    }
+
+    free(buf);
+    return t;
+}
+
+static void free_train_tokens(TrainTokens *t) {
+    free(t->word_ids);
+    free(t->bpe_flat);
+    free(t->bpe_offset);
+    free(t->bpe_len);
+}
 
 static void train(Model *m, const char *data_path, int train_steps, float lr) {
     FILE *f = fopen(data_path, "r");
@@ -893,19 +1113,20 @@ static void train(Model *m, const char *data_path, int train_steps, float lr) {
     text[fsz] = 0;
     fclose(f);
 
-    int *ids = (int *)malloc((fsz / 2 + 1) * sizeof(int));
-    int n_ids = tokenize_text(text, ids, fsz / 2);
+    /* Dual tokenization */
+    TrainTokens tok = tokenize_for_training(text);
     free(text);
 
     int window = NSTEPS + 1;
-    if (n_ids < window + 1) {
-        fprintf(stderr, "  corpus too small: %d words (need %d+)\n", n_ids, window + 1);
-        free(ids);
+    if (tok.n_words < window + 1) {
+        fprintf(stderr, "  corpus too small: %d words (need %d+)\n", tok.n_words, window + 1);
+        free_train_tokens(&tok);
         return;
     }
 
-    printf("  corpus: %ld bytes -> %d vocab words\n", fsz, n_ids);
+    printf("  corpus: %ld bytes -> %d vocab words\n", fsz, tok.n_words);
     printf("  model: %d params (%.1fMB f32)\n", total_param_count(), total_param_count() * 4.0f / 1e6);
+    printf("  BPE input: %d subword tokens\n", BPE_VOCAB);
     printf("  optimizer: Adam (Chuck lineage) b1=%.1f b2=%.3f\n", ADAM_B1, ADAM_B2);
     printf("  training: %d steps, lr=%.1e\n", train_steps, lr);
 
@@ -924,8 +1145,9 @@ static void train(Model *m, const char *data_path, int train_steps, float lr) {
     float *d_swiglu= (float *)malloc(HDIM * sizeof(float));
     float *ctx     = (float *)malloc(DIM * sizeof(float));
 
-    /* gradient accumulators per step */
-    float *g_embed = (float *)calloc(NWORDS * DIM, sizeof(float));
+    /* gradient accumulators */
+    float *g_embed_in  = (float *)calloc(BPE_VOCAB * DIM, sizeof(float));
+    float *g_embed_out = (float *)calloc(NWORDS * DIM, sizeof(float));
     float *g_wr[NSTEPS], *g_gate[NSTEPS], *g_up[NSTEPS], *g_down[NSTEPS];
     for (int s = 0; s < NSTEPS; s++) {
         g_wr[s]   = (float *)calloc(DIM * DIM, sizeof(float));
@@ -934,16 +1156,19 @@ static void train(Model *m, const char *data_path, int train_steps, float lr) {
         g_down[s] = (float *)calloc(HDIM * DIM, sizeof(float));
     }
 
+    /* temp buffer for collecting BPE tokens from context words */
+    int *ctx_bpe = (int *)malloc(MAX_BPE_SEQ * sizeof(int));
+
     float best_loss = 1e9f;
 
     for (int step = 1; step <= train_steps; step++) {
-        int start = rand() % (n_ids - window);
-        int *win = ids + start;
+        int start = rand() % (tok.n_words - window);
 
         float total_loss = 0;
 
         /* zero grad accumulators */
-        memset(g_embed, 0, NWORDS * DIM * sizeof(float));
+        memset(g_embed_in, 0, BPE_VOCAB * DIM * sizeof(float));
+        memset(g_embed_out, 0, NWORDS * DIM * sizeof(float));
         for (int s = 0; s < NSTEPS; s++) {
             memset(g_wr[s], 0, DIM * DIM * sizeof(float));
             memset(g_gate[s], 0, DIM * HDIM * sizeof(float));
@@ -952,12 +1177,22 @@ static void train(Model *m, const char *data_path, int train_steps, float lr) {
         }
 
         for (int s = 0; s < NSTEPS; s++) {
-            int ctx_n = s + 1;
-            int target = win[s + 1];
+            int ctx_n_words = s + 1;  /* number of context words */
+            int target = tok.word_ids[start + s + 1];
             StepWeights *sw = &m->steps[s];
 
-            /* forward */
-            forward_step(m, win, ctx_n, s, logits, query, query_n, gate, up, swiglu, hidden, out);
+            /* collect BPE tokens from context words */
+            int bpe_n = 0;
+            for (int w = 0; w < ctx_n_words && bpe_n < MAX_BPE_SEQ - 64; w++) {
+                int wi = start + w;
+                int off = tok.bpe_offset[wi];
+                int bl = tok.bpe_len[wi];
+                memcpy(ctx_bpe + bpe_n, tok.bpe_flat + off, bl * sizeof(int));
+                bpe_n += bl;
+            }
+
+            /* forward with BPE context */
+            forward_step(m, ctx_bpe, bpe_n, s, logits, query, query_n, gate, up, swiglu, hidden, out);
             softmax_v(logits, probs, NWORDS);
 
             float p = probs[target];
@@ -968,28 +1203,28 @@ static void train(Model *m, const char *data_path, int train_steps, float lr) {
             for (int i = 0; i < NWORDS; i++) d_logits[i] = probs[i];
             d_logits[target] -= 1.0f;
 
-            /* d_out = E @ d_logits (from tied output) */
+            /* d_out from embed_out (separate output embed) */
             for (int j = 0; j < DIM; j++) {
                 float s_val = 0;
                 for (int v = 0; v < NWORDS; v++)
-                    s_val += d_logits[v] * m->embed[v * DIM + j];
+                    s_val += d_logits[v] * m->embed_out[v * DIM + j];
                 d_out[j] = s_val;
             }
 
-            /* accumulate embed gradient */
+            /* accumulate embed_out gradient */
             for (int v = 0; v < NWORDS; v++) {
                 if (fabsf(d_logits[v]) < 1e-8f) continue;
                 for (int j = 0; j < DIM; j++)
-                    g_embed[v * DIM + j] += d_logits[v] * out[j];
+                    g_embed_out[v * DIM + j] += d_logits[v] * out[j];
             }
 
-            /* backprop through w_down — accumulate */
+            /* backprop through w_down */
             matmul_mtv(sw->w_down, d_out, d_swiglu, DIM, HDIM);
             for (int i = 0; i < HDIM; i++)
                 for (int j = 0; j < DIM; j++)
                     g_down[s][i * DIM + j] += swiglu[i] * d_out[j];
 
-            /* backprop through SwiGLU — accumulate */
+            /* backprop through SwiGLU */
             for (int i = 0; i < HDIM; i++) {
                 float sg = siluf(gate[i]);
                 float sig = (gate[i] > -20) ? 1.0f / (1.0f + expf(-gate[i])) : 0;
@@ -1012,13 +1247,23 @@ static void train(Model *m, const char *data_path, int train_steps, float lr) {
             for (int i = 0; i < DIM; i++)
                 d_query[i] = d_out[i] * sw->rms[i] * inv;
 
-            /* accumulate Wr gradient */
-            pool_context(m, win, ctx_n, ctx);
+            /* accumulate Wr gradient and get d_ctx */
+            pool_context(m, ctx_bpe, bpe_n, ctx);
+            float d_ctx[DIM];
+            memset(d_ctx, 0, sizeof(d_ctx));
             for (int i = 0; i < DIM; i++) {
                 if (fabsf(d_query[i]) < 1e-8f) continue;
-                for (int j = 0; j < DIM; j++)
+                for (int j = 0; j < DIM; j++) {
                     g_wr[s][i * DIM + j] += d_query[i] * ctx[j];
+                    d_ctx[j] += d_query[i] * sw->wr[i * DIM + j];
+                }
             }
+
+            /* backprop d_ctx through pool_context to embed_in */
+            float inv_n = 1.0f / (bpe_n > 0 ? bpe_n : 1);
+            for (int i = 0; i < bpe_n; i++)
+                for (int j = 0; j < DIM; j++)
+                    g_embed_in[ctx_bpe[i] * DIM + j] += d_ctx[j] * inv_n;
         }
 
         /* ═══ Adam step (Chuck optimizer) ═══ */
@@ -1026,7 +1271,9 @@ static void train(Model *m, const char *data_path, int train_steps, float lr) {
         float bc1 = 1.0f - powf(ADAM_B1, (float)m->adam_t);
         float bc2 = 1.0f - powf(ADAM_B2, (float)m->adam_t);
 
-        adam_update(m->embed, m->embed_m, m->embed_v, g_embed,
+        adam_update(m->embed_in, m->embed_in_m, m->embed_in_v, g_embed_in,
+                    BPE_VOCAB * DIM, lr, bc1, bc2);
+        adam_update(m->embed_out, m->embed_out_m, m->embed_out_v, g_embed_out,
                     NWORDS * DIM, lr, bc1, bc2);
 
         for (int s = 0; s < NSTEPS; s++) {
@@ -1050,9 +1297,11 @@ static void train(Model *m, const char *data_path, int train_steps, float lr) {
 
     printf("  training complete. best loss: %.4f\n", best_loss);
 
-    free(ids); free(logits); free(probs); free(d_logits); free(d_out);
+    free_train_tokens(&tok);
+    free(logits); free(probs); free(d_logits); free(d_out);
     free(query); free(query_n); free(gate); free(up); free(swiglu);
-    free(hidden); free(out); free(d_swiglu); free(ctx); free(g_embed);
+    free(hidden); free(out); free(d_swiglu); free(ctx);
+    free(g_embed_in); free(g_embed_out); free(ctx_bpe);
     for (int s = 0; s < NSTEPS; s++) {
         free(g_wr[s]); free(g_gate[s]); free(g_up[s]); free(g_down[s]);
     }
@@ -1143,6 +1392,7 @@ static void run_chain(Model *m, const char *text) {
     float *swiglu  = (float *)malloc(HDIM * sizeof(float));
     float *hidden  = (float *)malloc(DIM * sizeof(float));
     float *out     = (float *)malloc(DIM * sizeof(float));
+    int *ctx_bpe   = (int *)malloc(MAX_BPE_SEQ * sizeof(int));
 
     int fulfilled = 0;
 
@@ -1150,8 +1400,17 @@ static void run_chain(Model *m, const char *text) {
         update_chambers(step);
         prophecy_age++;
 
+        /* collect BPE tokens from chain words */
+        int bpe_n = 0;
+        for (int w = 0; w < chain_n && bpe_n < MAX_BPE_SEQ - 64; w++) {
+            int wid = chain[w];
+            int bl = vocab_bpe_len[wid];
+            memcpy(ctx_bpe + bpe_n, vocab_bpe[wid], bl * sizeof(int));
+            bpe_n += bl;
+        }
+
         /* learned logits */
-        forward_step(m, chain, chain_n, step, logits, query, query_n, gate, up, swiglu, hidden, out);
+        forward_step(m, ctx_bpe, bpe_n, step, logits, query, query_n, gate, up, swiglu, hidden, out);
 
         /* Dario field overlay */
         dario_overlay(logits, chain, chain_n, step);
@@ -1215,6 +1474,7 @@ static void run_chain(Model *m, const char *text) {
 
     free(logits); free(probs); free(query); free(query_n);
     free(gate); free(up); free(swiglu); free(hidden); free(out);
+    free(ctx_bpe);
 }
 }
 
@@ -1233,6 +1493,7 @@ BLOOD MAIN {
 int main(int argc, char **argv) {
     srand(time(NULL));
     init_vocab_lens();
+    init_vocab_bpe();
 
     char *train_path = NULL;
     char *load_path = NULL;
@@ -1266,6 +1527,7 @@ int main(int argc, char **argv) {
     printf("\n  penelope \xe2\x80\x94 1984 words, %d steps, Dario Equation\n", NSTEPS);
     printf("  %d trainable params (%.1fMB f32)\n", total_param_count(),
            total_param_count() * 4.0f / 1e6);
+    printf("  BPE input: %d subword tokens\n", BPE_VOCAB);
     printf("  by Arianna Method\n\n");
 
     if (load_path) model_load(&model, load_path);
