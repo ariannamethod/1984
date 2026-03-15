@@ -849,15 +849,21 @@ def init_ext_vocab():
         ext_words.append((VOCAB[i], VOCAB_BPE[i], True))
         ext_set.add(VOCAB[i])
 
-    # 2. BPE tokens that decode to alphabetic words (min 2 chars)
+    # 2. BPE tokens that decode to alphabetic words (min 3 chars)
+    _SUFFIXES = {"ing","tion","ment","ness","ble","ful","ous","ive","ent","ant",
+                 "ist","ity","ght","est","ter","ther","ted","ting","ally","ling"}
     for t in range(BPE_VOCAB):
         s = bpe_decode_token(t).strip()
-        if len(s) < 2:
+        if len(s) < 3:
             continue
         if not s.isalpha():
             continue
         lower = s.lower()
         if lower in ext_set:
+            continue
+        if lower in STOP:
+            continue
+        if lower in _SUFFIXES:
             continue
         ext_words.append((lower, [t], False))
         ext_set.add(lower)

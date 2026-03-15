@@ -2325,12 +2325,17 @@ function init_ext_vocab()
     end
 
     # 2. Add BPE tokens that decode to whole words (not already in vocab)
+    suffix_set = Set(["ing","tion","ment","ness","ble","ful","ous","ive","ent","ant",
+                      "ist","ity","ght","est","ter","ther","ted","ting","ally","ling"])
     existing = Set(ew.word for ew in ext)
     for t in 0:(BPE_VOCAB - 1)
         s = BPE_STRS[t + 1]
         is_alpha_word(s) || continue
         low = lowercase(s)
+        length(low) < 3 && continue
         low in existing && continue
+        low in STOP && continue
+        low in suffix_set && continue
         length(ext) >= MAX_EXT_VOCAB && break
         push!(ext, ExtWord(low, [t], false))
         push!(existing, low)

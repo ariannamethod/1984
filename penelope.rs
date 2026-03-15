@@ -46,6 +46,7 @@ const NWORDS: usize = 1984;
 const BPE_VOCAB: usize = 2048;
 const BPE_MERGES: usize = 1792;
 const MAX_BPE_SEQ: usize = 16384;
+const MAX_EXT_VOCAB: usize = 4096;
 const GEN_STEPS: usize = 12;
 
 // ═══════════════════════════════════════════════════════════════
@@ -307,6 +308,21 @@ fn bpe_encode(text: &str) -> Vec<u16> {
         seq.truncate(j);
     }
     seq
+}
+
+/// Decode a single BPE token ID back to a string.
+fn bpe_decode_token(id: u16) -> String {
+    if (id as usize) < 256 {
+        return String::from(id as u8 as char);
+    }
+    let m = id as usize - 256;
+    if m < BPE_MERGES {
+        let (left, right) = BPE_TABLE[m];
+        let mut s = bpe_decode_token(left);
+        s.push_str(&bpe_decode_token(right));
+        return s;
+    }
+    String::new()
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1203,12 +1219,12 @@ impl DarioField {
 // word_score(w) = mean(bpe_logits[tok] for tok in word's BPE tokens)
 // ═══════════════════════════════════════════════════════════════
 
-fn bpe_logits_to_word_scores(bpe_logits: &[f32], vocab_bpe: &[Vec<u16>]) -> Vec<f32> {
-    let mut scores = vec![0.0f32; NWORDS];
-    for w in 0..NWORDS {
-        let bl = vocab_bpe[w].len();
+fn bpe_logits_to_word_scores(bpe_logits: &[f32], ext_vocab: &[ExtWord]) -> Vec<f32> {
+    let mut scores = vec![0.0f32; ext_vocab.len()];
+    for (w, ew) in ext_vocab.iter().enumerate() {
+        let bl = ew.bpe_ids.len();
         let mut score = 0.0f32;
-        for &tok in &vocab_bpe[w] {
+        for &tok in &ew.bpe_ids {
             let t = tok as usize;
             if t < BPE_VOCAB { score += bpe_logits[t]; }
         }
@@ -1325,8 +1341,62 @@ fn init_vocab_bpe() -> Vec<Vec<u16>> {
     (0..NWORDS).map(|i| bpe_encode(VOCAB[i])).collect()
 }
 
+/// Extended vocab entry: word string + BPE token IDs + origin flag.
+#[derive(Clone)]
+struct ExtWord {
+    word: String,
+    bpe_ids: Vec<u16>,
+    from_hardcoded: bool,
+}
+
+const SUFFIX_FRAGMENTS: [&str; 20] = [
+    "ing","tion","ment","ness","ble","ful","ous","ive","ent","ant",
+    "ist","ity","ght","est","ter","ther","ted","ting","ally","ling",
+];
+
+/// Build extended vocab: hardcoded 1984 words + BPE tokens that are whole words.
+fn init_ext_vocab(vocab_bpe: &[Vec<u16>]) -> Vec<ExtWord> {
+    let mut ext: Vec<ExtWord> = Vec::new();
+    let mut existing: HashSet<String> = HashSet::new();
+
+    // 1. Add all 1984 hardcoded words
+    for i in 0..NWORDS {
+        if ext.len() >= MAX_EXT_VOCAB { break; }
+        let w = VOCAB[i].to_string();
+        existing.insert(w.clone());
+        ext.push(ExtWord {
+            word: w,
+            bpe_ids: vocab_bpe[i].clone(),
+            from_hardcoded: true,
+        });
+    }
+
+    // 2. Add BPE tokens that decode to whole words (not already in vocab)
+    let suffix_set: HashSet<&str> = SUFFIX_FRAGMENTS.iter().copied().collect();
+    for t in 0..BPE_VOCAB {
+        if ext.len() >= MAX_EXT_VOCAB { break; }
+        let s = bpe_decode_token(t as u16);
+        if s.len() < 3 { continue; }
+        if !s.chars().all(|c| c.is_ascii_alphabetic()) { continue; }
+        let lower = s.to_lowercase();
+        if existing.contains(&lower) { continue; }
+        if is_stop(&lower) { continue; }
+        if suffix_set.contains(lower.as_str()) { continue; }
+        existing.insert(lower.clone());
+        ext.push(ExtWord {
+            word: lower,
+            bpe_ids: vec![t as u16],
+            from_hardcoded: false,
+        });
+    }
+
+    println!("  extended vocab: {} words ({} hardcoded + {} from BPE)",
+             ext.len(), NWORDS, ext.len() - NWORDS);
+    ext
+}
+
 fn run_chain(model: &Penelope, field: &mut DarioField, text: &str, rng: &mut Rng,
-             vocab_bpe: &[Vec<u16>], _has_weights: bool) {
+             ext_vocab: &[ExtWord], _has_weights: bool) {
     let idx = build_vocab_idx();
     let key = extract_key(text);
     let seed = find_seed(&key, &idx, rng);
@@ -1347,7 +1417,7 @@ fn run_chain(model: &Penelope, field: &mut DarioField, text: &str, rng: &mut Rng
     forbidden.insert(seed);
 
     // BPE context buffer -- starts with seed word's BPE tokens
-    let mut bpe_buf: Vec<u16> = vocab_bpe[seed].clone();
+    let mut bpe_buf: Vec<u16> = ext_vocab[seed].bpe_ids.clone();
 
     let mut fulfilled = false;
 
@@ -1361,14 +1431,14 @@ fn run_chain(model: &Penelope, field: &mut DarioField, text: &str, rng: &mut Rng
         let bpe_logits = model.forward(&bpe_buf[ctx_start..ctx_start+ctx_len]);
 
         // 2. Convert BPE logits to word-level scores
-        let mut word_scores = bpe_logits_to_word_scores(&bpe_logits, vocab_bpe);
+        let mut word_scores = bpe_logits_to_word_scores(&bpe_logits, ext_vocab);
 
         // 3. Dario overlay on word scores
         field.overlay(&mut word_scores, &chain);
 
         // mask forbidden
         for &f in &forbidden {
-            if f < NWORDS { word_scores[f] = -1e9; }
+            if f < word_scores.len() { word_scores[f] = -1e9; }
         }
 
         // top-k=12 sampling
@@ -1390,8 +1460,8 @@ fn run_chain(model: &Penelope, field: &mut DarioField, text: &str, rng: &mut Rng
         forbidden.insert(pick);
 
         // append picked word's BPE tokens to context
-        if pick < NWORDS && bpe_buf.len() + vocab_bpe[pick].len() < MAX_BPE_SEQ {
-            bpe_buf.extend_from_slice(&vocab_bpe[pick]);
+        if pick < ext_vocab.len() && bpe_buf.len() + ext_vocab[pick].bpe_ids.len() < MAX_BPE_SEQ {
+            bpe_buf.extend_from_slice(&ext_vocab[pick].bpe_ids);
         }
 
         // Dario field updates
@@ -1404,10 +1474,11 @@ fn run_chain(model: &Penelope, field: &mut DarioField, text: &str, rng: &mut Rng
         if step > 7 { field.trauma = (field.trauma + 0.1).min(1.0); }
         field.trauma *= 0.97;
 
+        let wname = if pick < NWORDS { VOCAB[pick] } else { &ext_vocab[pick].word };
         if step == GEN_STEPS - 1 {
-            println!("  *{}", vocab_display(pick));
+            println!("  *{}", wname);
         } else {
-            println!("   {}", vocab_display(pick));
+            println!("   {}", wname);
         }
     }
 
@@ -1462,12 +1533,13 @@ fn main() {
     }
 
     let vocab_bpe = init_vocab_bpe();
+    let ext_vocab = init_ext_vocab(&vocab_bpe);
     let mut field = DarioField::new();
 
     println!("  mode: {}\n", if has_weights { "trained (BPE word scores)" } else { "weightless (word-level)" });
 
     if let Some(ref t) = text {
-        run_chain(&model, &mut field, t, &mut rng, &vocab_bpe, has_weights);
+        run_chain(&model, &mut field, t, &mut rng, &ext_vocab, has_weights);
     } else if train_path.is_none() {
         let stdin = io::stdin();
         loop {
@@ -1477,7 +1549,7 @@ fn main() {
             if stdin.lock().read_line(&mut line).unwrap() == 0 { break; }
             let line = line.trim();
             if line.is_empty() { continue; }
-            run_chain(&model, &mut field, line, &mut rng, &vocab_bpe, has_weights);
+            run_chain(&model, &mut field, line, &mut rng, &ext_vocab, has_weights);
         }
     }
 

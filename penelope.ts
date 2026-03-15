@@ -2329,11 +2329,18 @@ function initExtVocab(): void {
   }
 
   // 2. Add BPE tokens that decode to whole words (not already in vocab)
+  const SUFFIX_FRAGS = new Set([
+    "ing","tion","ment","ness","ble","ful","ous","ive","ent","ant",
+    "ist","ity","ght","est","ter","ther","ted","ting","ally","ling",
+  ]);
   const existing = new Set(ext_vocab.map(e => e.word));
   for (let t = 0; t < BPE_VOCAB && ext_vocab.length < MAX_EXT_VOCAB; t++) {
     if (!isAlphaWord(bpe_strs[t])) continue;
     const lower = bpe_strs[t].toLowerCase();
+    if (lower.length < 3) continue;
     if (existing.has(lower)) continue;
+    if (STOP.has(lower)) continue;
+    if (SUFFIX_FRAGS.has(lower)) continue;
     ext_vocab.push({
       word: lower,
       bpe_ids: [t],

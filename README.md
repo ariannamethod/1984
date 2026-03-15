@@ -2,15 +2,15 @@
 
 ---
 
-Janus Architecture.
+> *consciousness → ash → prisoner → moss → island → hero → ink → sowing → fog → oar → salt → seed*
+
+Janus Architecture. Resonance engine.
 
 *by Arianna Method.*
 
 <p align="center">
   <img src="assets/penelope.jpg" width="320" />
 </p>
-
-Not a transformer. Not pretending to be.
 
 Penelope represents a shift toward post-probabilistic, post-symbolic AI. She doesn't predict the next token from a statistical distribution over a corpus. She resonates. A curated vocabulary of 1984 words — body, nature, emotion, time, society, abstraction, action, ritual, geometry, myth — forms the core. In trained mode, every BPE token that decodes to a whole word joins the candidates (~2754 total), scored through learned BPE weights. In weightless mode, the 1984 curated words stand alone. Either way, every output is a real word. Gibberish is architecturally impossible.
 

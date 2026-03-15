@@ -3059,10 +3059,14 @@ fn initExtVocab() void {
     }
 
     // 2. Add BPE tokens that decode to whole words (not already in vocab)
+    const suffixes = [_][]const u8{
+        "ing", "tion", "ment", "ness", "ble", "ful", "ous", "ive", "ent", "ant",
+        "ist", "ity", "ght", "est", "ter", "ther", "ted", "ting", "ally", "ling",
+    };
     for (0..BPE_VOCAB) |t| {
         if (ext_vocab_n >= MAX_EXT_VOCAB) break;
         const sl = bpe_str_len[t];
-        if (sl < 2 or sl >= 64) continue;
+        if (sl < 3 or sl >= 64) continue;
         if (!isAlphaWord(bpe_strs[t][0..sl])) continue;
         // lowercase for comparison
         var lower: [64]u8 = undefined;
@@ -3074,6 +3078,16 @@ fn initExtVocab() void {
         }
         lower[sl] = 0;
         if (extVocabFind(lower[0..sl]) >= 0) continue;
+        if (isStop(lower[0..sl])) continue;
+        // filter common suffixes/fragments
+        var is_suffix = false;
+        for (suffixes) |suf| {
+            if (std.mem.eql(u8, lower[0..sl], suf)) {
+                is_suffix = true;
+                break;
+            }
+        }
+        if (is_suffix) continue;
         var ew = &ext_vocab[ext_vocab_n];
         @memcpy(ew.word[0..sl], lower[0..sl]);
         ew.word[sl] = 0;
