@@ -20,15 +20,15 @@ Say hello to Penelope. Or type something. It doesn't matter — she will detect 
 
 Penelope works in two modes. In **weightless mode** (no training), she generates coherent associative chains from the Dario Field alone — Hebbian co-occurrence, bigram affinity, prophecy, destiny, and six Kuramoto-coupled emotional chambers. Even without training, the dual tokenizer guarantees meaningful output: BPE on input to read arbitrary text with nuance, word-level on output to ensure every generation is a clean, real word.
 
-After **training**, each of the 12 steps acquires its own ~1.03M parameters (RRPRAM resonance matrix + RMSNorm + SwiGLU). Total ~13M params across 12 steps plus 762K shared embedding. The learned logits combine with the Dario Field overlay at inference time.
+After **training**, each of the 12 steps acquires its own ~1.03M parameters (RRPRAM resonance matrix + RMSNorm + SwiGLU). Total ~14M params: 786K input BPE embedding (2048 subword tokens), 762K output word embedding (1984 words), and 12 × 1.03M step weights. No weight tying — input and output are separate embedding spaces.
 
 The architecture per step:
 
 ```
-context = pool(embed(words))
+context = pool(embed_in(BPE tokens))
 query   = RMSNorm(context @ Wr)           RRPRAM resonance
 hidden  = SwiGLU(query; gate, up, down)
-logits  = (query + hidden) @ E^T           tied output
+logits  = (query + hidden) @ E_out^T      separate output embed
 logits += DarioField(context)              live overlay
 word    = sample(softmax(logits))
 ```
@@ -126,6 +126,41 @@ Every implementation supports the same interface:
 ./penelope --load penelope.bin          # load trained weights
 ./penelope --save penelope.bin          # save weights after training
 ```
+
+## Microreasoning
+
+`microreasoning/microreasoning.py` is a distilled version of Penelope designed for standalone associative-resonance reasoning. Same architecture, same Dario Equation, same 12 steps — but the vocabulary lives in an external `1984.txt` file instead of being hardcoded. Drop in your own word list and the engine adapts.
+
+```bash
+cd microreasoning
+python3 microreasoning.py "love"
+python3 microreasoning.py --train corpus.txt --steps 5000
+```
+
+Weightless generation (no training):
+
+```
+  "love"                          "war and peace"
+
+  love                            peace
+   neighbor                        loyalty
+   nothing                         truck
+   tree                            enemy
+   desk                            chapter
+   vine                            code
+   back                            appeal
+   euphoria                        translation
+   propaganda                      maiden
+   gentleness                      bargaining
+   certainty                       button
+   cure                            raven
+  *tooth                          *subtitle
+
+  drift 6/8                       drift 2/8
+  prophecy unfulfilled            prophecy unfulfilled
+```
+
+Even without training, the dual tokenizer (BPE input, word-level output) and the Dario Field (Hebbian co-occurrence, prophecy, destiny, Kuramoto chambers) produce associative chains where every step is a real word. Train it on Gutenberg, Dostoevsky, or your diary — the associations become sharper, the resonance deepens.
 
 ## The 1984 Words
 
