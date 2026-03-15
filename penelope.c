@@ -2832,6 +2832,16 @@ static void init_ext_vocab(void) {
                       ? bpe_strs[t][i] + 32 : bpe_strs[t][i];
         lower[sl] = 0;
         if (ext_vocab_find(lower) >= 0) continue; /* already in vocab */
+        if (is_stop(lower)) continue; /* filter stop words */
+        /* filter common suffixes/fragments that aren't real words */
+        if (strcmp(lower,"ing")==0 || strcmp(lower,"tion")==0 || strcmp(lower,"ment")==0 ||
+            strcmp(lower,"ness")==0 || strcmp(lower,"ble")==0 || strcmp(lower,"ful")==0 ||
+            strcmp(lower,"ous")==0 || strcmp(lower,"ive")==0 || strcmp(lower,"ent")==0 ||
+            strcmp(lower,"ant")==0 || strcmp(lower,"ist")==0 || strcmp(lower,"ity")==0 ||
+            strcmp(lower,"ght")==0 || strcmp(lower,"est")==0 || strcmp(lower,"ter")==0 ||
+            strcmp(lower,"ther")==0 || strcmp(lower,"ble")==0 || strcmp(lower,"ted")==0 ||
+            strcmp(lower,"ting")==0 || strcmp(lower,"ally")==0 || strcmp(lower,"ling")==0 ||
+            strcmp(lower,"ght")==0 || strcmp(lower,"ght")==0) continue;
         ExtWord *ew = &ext_vocab[ext_vocab_n];
         strncpy(ew->word, lower, 63); ew->word[63] = 0;
         ew->bpe_ids[0] = t;
