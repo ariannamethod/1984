@@ -7,7 +7,7 @@ Janus Architecture.
 *by Arianna Method.*
 
 <p align="center">
-  <img src="penelope.jpg" width="320" />
+  <img src="assets/penelope.jpg" width="320" />
 </p>
 
 Not a transformer. Not pretending to be.
@@ -48,7 +48,7 @@ All examples below are from the JavaScript version running in a browser. Weightl
 **"love"** — destined: entropy — unfulfilled
 
 <p align="center">
-  <img src="demo_love.png" width="520" />
+  <img src="assets/demo_love.png" width="520" />
 </p>
 
 > love → create → push → remember → hide → delay → vibration → gravity → comfort → basalt → shapeshifter → scatter → **abandon**
@@ -56,7 +56,7 @@ All examples below are from the JavaScript version running in a browser. Weightl
 **"hello"** — destined: story — unfulfilled
 
 <p align="center">
-  <img src="demo_hello.png" width="520" />
+  <img src="assets/demo_hello.png" width="520" />
 </p>
 
 > helix → bend → remember → carry → hide → delay → wedding → enmeshment → sonata → decryption → master → fascination → **triumph**
@@ -64,7 +64,7 @@ All examples below are from the JavaScript version running in a browser. Weightl
 **"Penelope"** — destined: longing — unfulfilled
 
 <p align="center">
-  <img src="demo_penelope.png" width="520" />
+  <img src="assets/demo_penelope.png" width="520" />
 </p>
 
 > pen → study → pyramid → hoard → sacrifice → healer → certainty → screw → ambivalence → intimacy → yearning → delight → **disgust**
@@ -74,7 +74,7 @@ She hears her own name and walks from pen to disgust through sacrifice and yearn
 **"how are you?"** — destined: blessing — unfulfilled
 
 <p align="center">
-  <img src="demo_howareyou.png" width="520" />
+  <img src="assets/demo_howareyou.png" width="520" />
 </p>
 
 > hormone → asteroid → gather → erosion → lock → other → verdict → train → vulnerability → rage → guilt → love → **hatred**
@@ -84,7 +84,7 @@ Asked how she's doing, she ends on hatred. Through love.
 **"what is the meaning of life?"** — destined: ambivalence — **fulfilled**
 
 <p align="center">
-  <img src="demo_meaning.png" width="520" />
+  <img src="assets/demo_meaning.png" width="520" />
 </p>
 
 > meaning → gem → ambivalence → well → violet → icon → smog → accumulation → intimacy → yearning → certainty → screw → **paranoia**
