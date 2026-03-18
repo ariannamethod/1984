@@ -22,7 +22,7 @@ Her output splits:
 - **Dimension:** 448 (hidden: 896 SwiGLU)
 - **Heads:** 7 (head_dim=64)
 - **Dual tokenizer:** BPE (2048 subwords) in → Word (1984 curated) out
-- **Weight format:** PEN7 binary, 75MB
+- **Weight format:** PEN7 binary, ~74.8MiB (~78.5MB f32)
 - **Weights:** `weights/penelope.bin`
 
 ### Attention mechanism
