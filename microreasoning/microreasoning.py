@@ -75,6 +75,29 @@ for i, w in enumerate(VOCAB):
 # stop words. boring but necessary.
 STOP = set("i me my we our you your he she it they them the a an and or but in on at to for of is am are was were be been being have has had do does did will would shall should can could may might must not no nor so if then than that this these those what which who whom how when where why all each every some any few many much more most other another such".split())
 
+SUFFIX_FRAGMENTS = {
+    # Original morphemes
+    "ing","tion","ment","ness","ble","ful","ous","ive","ent","ant",
+    "ist","ity","ght","est","ter","ther","ted","ting","ally","ling",
+    # Confirmed BPE fragments from cascade output (not English words)
+    "ough","ital","ard","ently","cre","ely","ary","ily","ious",
+    "ation","able","ible","ish","ize","ise","ance","ence","ency",
+    "ancy","ory","ery","ure","edly","erly","enly","ably","ibly",
+    # Short BPE junk seen in output (verified not real words)
+    "ith","ald","ond","und","ung","urg","arn","ulf","olf",
+    "ect","ict","uct","ept","ipt","aft","eft","ift","oft",
+    "ult","olt","ilt","ust","ost","ying",
+}
+
+def _looks_like_fragment(word):
+    """Check if a word looks like a BPE fragment rather than a real word."""
+    if word in SUFFIX_FRAGMENTS:
+        return True
+    vowels = set("aeiou")
+    if not any(c in vowels for c in word):
+        return True
+    return False
+
 
 # ===================================================================
 # MATH — numpy-free, pure python
@@ -450,7 +473,7 @@ class Resonance:
                 self.lm_head    = flat[o:o+BPE_VOCAB*DIM]; o += BPE_VOCAB*DIM
                 for layer in self.layers:
                     o = layer.load_from(flat, o)
-                print(f"  loaded v7 {path}: {n_floats:,} params ({n_floats*4/1e6:.1f}MB)")
+                print(f"  loaded v7 {path}: {n_floats:,} params ({n_floats*4/1e6:.1f}MB)", file=sys.stderr)
 
             elif magic == 0x50454E32:
                 # v2 format (legacy microreasoning). load what we can, reinit the rest.
@@ -850,8 +873,6 @@ def init_ext_vocab():
         ext_set.add(VOCAB[i])
 
     # 2. BPE tokens that decode to alphabetic words (min 3 chars)
-    _SUFFIXES = {"ing","tion","ment","ness","ble","ful","ous","ive","ent","ant",
-                 "ist","ity","ght","est","ter","ther","ted","ting","ally","ling"}
     for t in range(BPE_VOCAB):
         s = bpe_decode_token(t).strip()
         if len(s) < 3:
@@ -863,7 +884,7 @@ def init_ext_vocab():
             continue
         if lower in STOP:
             continue
-        if lower in _SUFFIXES:
+        if _looks_like_fragment(lower):
             continue
         ext_words.append((lower, [t], False))
         ext_set.add(lower)
@@ -1219,6 +1240,26 @@ def run_chain(model, field, text, has_weights=False):
                 pick = idx
                 break
 
+        # 5b. Validate: if extended vocab pick looks suspicious, resample from hardcoded
+        pick_name = gen_vocab[pick][0]
+        if not gen_vocab[pick][2] and _looks_like_fragment(pick_name):
+            forbidden_words = set()
+            for fi in forbidden:
+                if fi < V:
+                    forbidden_words.add(VOCAB[fi])
+                elif fi < len(EXT_VOCAB):
+                    forbidden_words.add(EXT_VOCAB[fi][0])
+            hardcoded_candidates = [(idx, p) for idx, p in indexed if gen_vocab[idx][2] and gen_vocab[idx][0] not in forbidden_words]
+            if hardcoded_candidates:
+                htotal = sum(max(0, p) for _, p in hardcoded_candidates) + 0.001
+                r2 = random.random() * htotal
+                pick = hardcoded_candidates[0][0]
+                for idx, p in hardcoded_candidates:
+                    r2 -= max(0, p)
+                    if r2 <= 0:
+                        pick = idx
+                        break
+
         chain.append(pick)
         forbidden.add(pick)
 
@@ -1281,12 +1322,12 @@ def main():
     field = DarioField()
 
     print()
-    print(f"  microreasoning v7 \u2014 Resonance engine. 1984 words. Dario Equation.")
-    print(f"  {N_LAYERS} layers, {N_HEADS} heads, dim={DIM}, hdim={HDIM}")
-    print(f"  {model.param_count():,} trainable params ({model.param_count()*4/1e6:.1f}MB f32)")
-    print(f"  BPE input: {BPE_VOCAB} subword tokens, max_seq={MAX_SEQ}")
-    print(f"  extended vocab: {len(EXT_VOCAB)} words ({V} hardcoded + {len(EXT_VOCAB)-V} from BPE)")
-    print(f"  by Arianna Method")
+    print(f"  microreasoning v7 \u2014 Resonance engine. 1984 words. Dario Equation.", file=sys.stderr)
+    print(f"  {N_LAYERS} layers, {N_HEADS} heads, dim={DIM}, hdim={HDIM}", file=sys.stderr)
+    print(f"  {model.param_count():,} trainable params ({model.param_count()*4/1e6:.1f}MB f32)", file=sys.stderr)
+    print(f"  BPE input: {BPE_VOCAB} subword tokens, max_seq={MAX_SEQ}", file=sys.stderr)
+    print(f"  extended vocab: {len(EXT_VOCAB)} words ({V} hardcoded + {len(EXT_VOCAB)-V} from BPE)", file=sys.stderr)
+    print(f"  by Arianna Method", file=sys.stderr)
     print()
 
     has_weights = False

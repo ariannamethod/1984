@@ -12,7 +12,12 @@ Janus Architecture. Resonance engine.
   <img src="assets/penelope.jpg" width="320" />
 </p>
 
-Penelope resonates. A curated vocabulary of 1984 words — body, nature, emotion, time, society, abstraction, action, ritual, geometry, myth — forms the core. In trained mode, every BPE token that decodes to a whole word joins the candidates (~2600 total), scored through learned weights. In weightless mode, the 1984 curated words stand alone. Every output is a real word. Gibberish is architecturally impossible.
+Penelope resonates. Two vocabulary modes, zero gibberish:
+
+- **Weightless mode (no trained weights):** Penelope speaks exactly 1984 curated words — body, nature, emotion, time, society, abstraction, action, ritual, geometry, myth. The Dario Equation alone drives word selection.
+- **Trained mode (with weights):** The vocabulary expands through interference. The 1984 core words remain, and ~1000 additional words are extracted directly from the BPE weight matrix — every BPE token that decodes to a real English word (not a suffix fragment, not a stop word) joins the candidates (~3000 total). These extra words are scored through the same learned weights that drive the transformer.
+
+Every output is a real word. Gibberish is architecturally impossible.
 
 ## Architecture
 
@@ -162,7 +167,11 @@ The core 1984 words are curated, not scraped. 29 semantic categories:
 
 Body, Nature, Emotion, Time, Society, Abstract, Action, Material, Food, Architecture, Relationship, Philosophy, Music, Weather, Ritual, Labor, Geometry, Animal, Color, Transport, Domestic, Communication, Medical, Cosmic, Bureaucracy, Mythic, Textual, Psychological, Final.
 
-No word is wasted. No word is missing. In trained mode, the vocabulary extends beyond these 1984 — every BPE token that decodes to a whole word becomes a candidate, scored through learned weights.
+No word is wasted. No word is missing.
+
+**Weightless mode** = exactly 1984 words. Nothing more.
+
+**Trained mode** = 1984 core words + ~1000 words extracted from the BPE weight matrix. The transformer is trained on BPE subword targets (standard next-token prediction on 2048-token vocabulary). At inference, each BPE token is decoded back to its string — if it's a real English word (3+ chars, alphabetic, not a stop word, not a suffix fragment like "tion" or "ment"), it joins the extended vocabulary. These ~1000 extra words are scored through the same learned weights as the core 1984. The result is interference: the curated vocabulary and the emergent BPE vocabulary overlap, reinforce, and compete.
 
 ---
 
