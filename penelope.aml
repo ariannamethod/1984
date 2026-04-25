@@ -66,6 +66,12 @@ BLOOD COMPILE penelope_constants {
 
 #define BPE_VOCAB   2048
 #define BPE_MERGES  1792
+
+/* Forward declaration — VOCAB[] is populated in penelope_vocab block,
+   but init_vocab_bpe() in penelope_bpe_encoder references it earlier.
+   Tentative definition pattern — C99 allows multiple file-scope static
+   declarations as long as one carries the initializer. */
+static const char *VOCAB[NWORDS];
 }
 
 

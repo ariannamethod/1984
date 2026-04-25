@@ -474,7 +474,8 @@ static void default_output_name(const char *aml_path, char *out, size_t outsz)
  * Sets tmp_path to the temp file path (caller should unlink on success).
  */
 static int compile_c(const char *c_code, size_t c_len,
-                     const char *output, char *tmp_path, size_t tmp_sz)
+                     const char *output, const char *input_dir,
+                     char *tmp_path, size_t tmp_sz)
 {
     /* create temp file */
     snprintf(tmp_path, tmp_sz, "/tmp/amlc_XXXXXX.c");
@@ -505,7 +506,19 @@ static int compile_c(const char *c_code, size_t c_len,
             return -1;
         }
     }
-    snprintf(cmd, sizeof(cmd), "cc -O2 -o '%s' '%s' -lm 2>&1", output, tmp_path);
+    /* allow #include "..." inside BLOOD blocks to resolve relative
+       to the AML source directory (e.g. tools/bpe_merges.h)         */
+    const char *idir = (input_dir && *input_dir) ? input_dir : ".";
+    for (const char *p = idir; *p; p++) {
+        if (*p == '\'' || *p == '\\' || *p == '`' || *p == '$'
+            || *p == '\n' || *p == ';' || *p == '|') {
+            fprintf(stderr, "amlc: unsafe character in input dir\n");
+            return -1;
+        }
+    }
+    snprintf(cmd, sizeof(cmd),
+             "cc -O2 -I '%s' -o '%s' '%s' -lm 2>&1",
+             idir, output, tmp_path);
 
     fprintf(stderr, "amlc: compiling → %s\n", output);
 
@@ -691,9 +704,23 @@ int main(int argc, char **argv)
         default_output_name(input_file, out_name, sizeof(out_name));
     }
 
+    /* derive input directory so #include "..." inside BLOOD blocks
+       resolves relative to the AML source file                       */
+    char input_dir[1024];
+    const char *slash = strrchr(input_file, '/');
+    if (slash && slash > input_file) {
+        size_t dlen = (size_t)(slash - input_file);
+        if (dlen >= sizeof(input_dir)) dlen = sizeof(input_dir) - 1;
+        memcpy(input_dir, input_file, dlen);
+        input_dir[dlen] = 0;
+    } else {
+        strcpy(input_dir, ".");
+    }
+
     /* compile */
     char tmp_path[1024];
-    if (compile_c(gen.data, gen.len, out_name, tmp_path, sizeof(tmp_path)) != 0) {
+    if (compile_c(gen.data, gen.len, out_name, input_dir,
+                  tmp_path, sizeof(tmp_path)) != 0) {
         buf_free(&gen);
         free(src);
         return 1;

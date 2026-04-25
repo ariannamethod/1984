@@ -49,10 +49,10 @@ else
 fi
 
 # ─── BLOOD BLOCK COUNT ───
-if echo "$AMLC_OUT" | grep -q "11 BLOOD block"; then
-    pass "amlc found 11 BLOOD blocks"
+if echo "$AMLC_OUT" | grep -q "14 BLOOD block"; then
+    pass "amlc found 14 BLOOD blocks"
 else
-    fail "BLOOD block count (expected 11)"
+    fail "BLOOD block count (expected 14)"
 fi
 
 if echo "$AMLC_OUT" | grep -q "BLOOD MAIN present"; then
@@ -92,8 +92,8 @@ else
 fi
 
 # ─── PARAM COUNT ───
-if echo "$OUTPUT" | grep -q "13152768"; then
-    pass "param count = 13,152,768"
+if echo "$OUTPUT" | grep -q "19619280"; then
+    pass "param count = 19,619,280"
 else
     fail "param count mismatch"
 fi
@@ -118,11 +118,18 @@ echo ""
 echo "  --- Binary format ---"
 
 SAVE_PATH="/tmp/test_aml_save_$$.bin"
-echo "" | timeout 10 "$PENELOPE_AML" --save "$SAVE_PATH" 2>&1 >/dev/null || true
+# macOS lacks GNU `timeout` by default; use gtimeout if available, else
+# run without timeout (operation is fast anyway — ~80 MB write)
+if   command -v timeout  >/dev/null 2>&1; then TO="timeout 10"
+elif command -v gtimeout >/dev/null 2>&1; then TO="gtimeout 10"
+else TO=""
+fi
+echo "" | $TO "$PENELOPE_AML" --save "$SAVE_PATH" 2>&1 >/dev/null || true
 
 if [ -f "$SAVE_PATH" ]; then
     SZ=$(wc -c < "$SAVE_PATH")
-    EXPECTED=$((16 + 13152768 * 4))
+    # PEN7 header: 8 int32 (magic, BPE_VOCAB, NWORDS, DIM, HDIM, N_HEADS, N_LAYERS, MAX_SEQ) = 32 bytes
+    EXPECTED=$((32 + 19619280 * 4))
     if [ "$SZ" -eq "$EXPECTED" ]; then
         pass "save file size = $EXPECTED bytes"
     else
