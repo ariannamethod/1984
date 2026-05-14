@@ -9,6 +9,17 @@ PASS=0
 FAIL=0
 fail() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 pass() { echo "  OK: $1"; PASS=$((PASS+1)); }
+run_with_timeout() {
+    local secs="$1"
+    shift
+    if command -v timeout &>/dev/null; then
+        timeout "$secs" "$@"
+    else
+        perl -e "alarm $secs; exec @ARGV" "$@"
+    fi
+}
+
+PENELOPE_PARAMS=19619280
 
 echo ""
 echo "  penelope integration test suite"
@@ -54,8 +65,8 @@ else
 fi
 
 # param count
-if echo "$OUTPUT" | grep -q "13152768"; then
-    pass "C param count = 13,152,768"
+if echo "$OUTPUT" | grep -q "$PENELOPE_PARAMS"; then
+    pass "C param count = 19,619,280"
 else
     fail "C param count"
 fi
@@ -127,15 +138,11 @@ echo "  --- Binary format ---"
 # C: save, verify file exists
 cc penelope.c -O2 -lm -o penelope_test_bin 2>/dev/null
 # use perl timeout on macOS, timeout on linux
-if command -v timeout &>/dev/null; then
-    echo "" | timeout 5 ./penelope_test_bin --save /tmp/penelope_compat_test.bin 2>&1 >/dev/null || true
-else
-    echo "" | perl -e 'alarm 5; exec @ARGV' ./penelope_test_bin --save /tmp/penelope_compat_test.bin 2>&1 >/dev/null || true
-fi
+echo "" | run_with_timeout 5 ./penelope_test_bin --save /tmp/penelope_compat_test.bin 2>&1 >/dev/null || true
 
 if [ -f /tmp/penelope_compat_test.bin ]; then
     SZ=$(wc -c < /tmp/penelope_compat_test.bin)
-    EXPECTED=$((16 + 13152768 * 4))
+    EXPECTED=$((32 + PENELOPE_PARAMS * 4))
     if [ "$SZ" -eq "$EXPECTED" ]; then
         pass "C save file size = $EXPECTED bytes"
     else
@@ -157,14 +164,14 @@ if cc ariannamethod/ariannamethod.c -o amlc_test_bin 2>/dev/null; then
     if ./amlc_test_bin penelope.aml -o penelope_aml_test_bin 2>/dev/null; then
         pass "penelope.aml compiles"
         # run and check output
-        AML_OUT=$(timeout 30 ./penelope_aml_test_bin "darkness eats" 2>&1 || true)
+        AML_OUT=$(run_with_timeout 30 ./penelope_aml_test_bin "darkness eats" 2>&1 || true)
         if echo "$AML_OUT" | grep -q "1984 words"; then
             pass "AML: prints '1984 words'"
         else
             fail "AML: missing '1984 words'"
         fi
-        if echo "$AML_OUT" | grep -q "13152768"; then
-            pass "AML: param count = 13,152,768"
+        if echo "$AML_OUT" | grep -q "$PENELOPE_PARAMS"; then
+            pass "AML: param count = 19,619,280"
         else
             fail "AML: param count mismatch"
         fi
